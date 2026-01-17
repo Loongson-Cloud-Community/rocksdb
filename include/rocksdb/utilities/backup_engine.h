@@ -8,9 +8,9 @@
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
 #pragma once
-#ifndef ROCKSDB_LITE
 
 #include <cstdint>
+#include <forward_list>
 #include <functional>
 #include <map>
 #include <string>
@@ -23,6 +23,8 @@
 #include "rocksdb/status.h"
 
 namespace ROCKSDB_NAMESPACE {
+class BackupEngineReadOnlyBase;
+class BackupEngine;
 
 // The default DB file checksum function name.
 constexpr char kDbFileChecksumFuncName[] = "FileChecksumCrc32c";
@@ -75,6 +77,15 @@ struct BackupEngineOptions {
   // Default: true
   bool backup_log_files;
 
+  // Size of the buffer in bytes used for reading files.
+  // Enables optimally configuring the IO size based on the storage backend.
+  // If specified, takes precendence over the rate limiter burst size (if
+  // specified) as well as kDefaultCopyFileBufferSize.
+  // If 0, the rate limiter burst size (if specified) or
+  // kDefaultCopyFileBufferSize will be used.
+  // Default: 0
+  uint64_t io_buffer_size;
+
   // Max bytes that can be transferred in a second during backup.
   // If 0, go as fast as you can
   // This limit only applies to writes. To also limit reads,
@@ -115,8 +126,8 @@ struct BackupEngineOptions {
   // Default: true
   bool share_files_with_checksum;
 
-  // Up to this many background threads will copy files for CreateNewBackup()
-  // and RestoreDBFromBackup()
+  // Up to this many background threads will be used to copy files & compute
+  // checksums for CreateNewBackup() and RestoreDBFromBackup().
   // Default: 1
   int max_background_operations;
 
@@ -226,8 +237,9 @@ struct BackupEngineOptions {
       const std::string& _backup_dir, Env* _backup_env = nullptr,
       bool _share_table_files = true, Logger* _info_log = nullptr,
       bool _sync = true, bool _destroy_old_data = false,
-      bool _backup_log_files = true, uint64_t _backup_rate_limit = 0,
-      uint64_t _restore_rate_limit = 0, int _max_background_operations = 1,
+      bool _backup_log_files = true, uint64_t _io_buffer_size = 0,
+      uint64_t _backup_rate_limit = 0, uint64_t _restore_rate_limit = 0,
+      int _max_background_operations = 1,
       uint64_t _callback_trigger_interval_size = 4 * 1024 * 1024,
       int _max_valid_backups_to_open = INT_MAX,
       ShareFilesNaming _share_files_with_checksum_naming =
@@ -239,6 +251,7 @@ struct BackupEngineOptions {
         sync(_sync),
         destroy_old_data(_destroy_old_data),
         backup_log_files(_backup_log_files),
+        io_buffer_size(_io_buffer_size),
         backup_rate_limit(_backup_rate_limit),
         restore_rate_limit(_restore_rate_limit),
         share_files_with_checksum(true),
@@ -270,6 +283,28 @@ inline BackupEngineOptions::ShareFilesNaming operator|(
   return static_cast<BackupEngineOptions::ShareFilesNaming>(l | r);
 }
 
+// Identifying information about a backup shared file that is (or might be)
+// excluded from a backup using exclude_files_callback.
+struct BackupExcludedFileInfo {
+  explicit BackupExcludedFileInfo(const std::string& _relative_file)
+      : relative_file(_relative_file) {}
+
+  // File name and path relative to the backup dir.
+  std::string relative_file;
+};
+
+// An auxiliary structure for exclude_files_callback
+struct MaybeExcludeBackupFile {
+  explicit MaybeExcludeBackupFile(BackupExcludedFileInfo&& _info)
+      : info(std::move(_info)) {}
+
+  // Identifying information about a backup shared file that could be excluded
+  const BackupExcludedFileInfo info;
+
+  // API user sets to true if the file should be excluded from this backup
+  bool exclude_decision = false;
+};
+
 struct CreateBackupOptions {
   // Flush will always trigger if 2PC is enabled.
   // If write-ahead logs are disabled, set flush_before_backup=true to
@@ -278,10 +313,31 @@ struct CreateBackupOptions {
 
   // Callback for reporting progress, based on callback_trigger_interval_size.
   //
-  // RocksDB callbacks are NOT exception-safe. A callback completing with an
-  // exception can lead to undefined behavior in RocksDB, including data loss,
-  // unreported corruption, deadlocks, and more.
-  std::function<void()> progress_callback = []() {};
+  // An exception thrown from the callback will result in Status::Aborted from
+  // the operation.
+  std::function<void()> progress_callback = {};
+
+  // A callback that allows the API user to select files for exclusion, such
+  // as if the files are known to exist in an alternate backup directory.
+  // Only "shared" files can be excluded from backups. This is an advanced
+  // feature because the BackupEngine user is trusted to keep track of files
+  // such that the DB can be restored.
+  //
+  // Input to the callback is a [begin,end) range of sharable files live in
+  // the DB being backed up, and the callback implementation sets
+  // exclude_decision=true for files to exclude. A callback offers maximum
+  // flexibility, e.g. if remote files are unavailable at backup time but
+  // whose existence has been recorded somewhere. In case of an empty or
+  // no-op callback, all files are included in the backup .
+  //
+  // To restore the DB, RestoreOptions::alternate_dirs must be used to provide
+  // the excluded files.
+  //
+  // An exception thrown from the callback will result in Status::Aborted from
+  // the operation.
+  std::function<void(MaybeExcludeBackupFile* files_begin,
+                     MaybeExcludeBackupFile* files_end)>
+      exclude_files_callback = {};
 
   // If false, background_thread_cpu_priority is ignored.
   // Otherwise, the cpu priority can be decreased,
@@ -293,6 +349,39 @@ struct CreateBackupOptions {
 };
 
 struct RestoreOptions {
+  // Enum reflecting tiered approach to restores.
+  //
+  // Options `kKeepLatestDbSessionIdFiles`, `kVerifyChecksum` introduce
+  // incremental restore capability and are intended to be used separately.
+  enum Mode : uint32_t {
+    // Most efficient way to restore a healthy / non-corrupted DB from
+    // the backup(s). This mode can almost always successfully recover from
+    // incomplete / missing files, as in an incomplete copy of a DB.
+    // This mode is also integrated with `exclude_files_callback` feature
+    // and will opportunistically try to find excluded files in existing db
+    // filesystem if missing in all supplied backup directories.
+    //
+    // Effective on data files following modern share files naming schemes.
+    kKeepLatestDbSessionIdFiles = 1U,
+
+    // Recommended when db is suspected to be unhealthy, ex. we want to retain
+    // most of the files (therefore saving on write I/O) with an exception of
+    // a few corrupted ones.
+    //
+    // When opted-in, restore engine will scan the db file, compute the
+    // checksum and compare it against the checksum hardened in the backup file
+    // metadata. If checksums match, existing file will be retained as-is.
+    // Otherwise, it will be deleted and replaced it with its' restored backup
+    // counterpart. If backup file doesn't have a checksum hardened in the
+    // metadata, we'll schedule an async task to compute it.
+    kVerifyChecksum = 2U,
+
+    // Zero trust. Least efficient.
+    //
+    // Purge all the destination files and restores all files from the backup.
+    kPurgeAllFiles = 0xffffU,
+  };
+
   // If true, restore won't overwrite the existing log files in wal_dir. It will
   // also move all log files from archive directory to wal_dir. Use this option
   // in combination with BackupEngineOptions::backup_log_files = false for
@@ -300,8 +389,18 @@ struct RestoreOptions {
   // Default: false
   bool keep_log_files;
 
-  explicit RestoreOptions(bool _keep_log_files = false)
-      : keep_log_files(_keep_log_files) {}
+  // For backups that were created using exclude_files_callback, this
+  // option enables restoring those backups by providing BackupEngines on
+  // directories known to contain the required files.
+  std::forward_list<BackupEngineReadOnlyBase*> alternate_dirs;
+
+  // Specifies the level of incremental restore. 'kPurgeAllFiles' by default.
+  Mode mode;
+
+  // FIXME(https://github.com/facebook/rocksdb/issues/13293)
+  explicit RestoreOptions(bool _keep_log_files = false,
+                          Mode _mode = Mode::kPurgeAllFiles)
+      : keep_log_files(_keep_log_files), mode(_mode) {}
 };
 
 using BackupID = uint32_t;
@@ -324,8 +423,14 @@ struct BackupInfo {
   // Backup API user metadata
   std::string app_metadata;
 
-  // Backup file details, if requested with include_file_details=true
+  // Backup file details, if requested with include_file_details=true.
+  // Does not include excluded_files.
   std::vector<BackupFileInfo> file_details;
+
+  // Identifying information about shared files that were excluded from the
+  // created backup. See exclude_files_callback and alternate_dirs.
+  // This information is only provided if include_file_details=true.
+  std::vector<BackupExcludedFileInfo> excluded_files;
 
   // DB "name" (a directory in the backup_env) for opening this backup as a
   // read-only DB. This should also be used as the DBOptions::wal_dir, such
@@ -348,8 +453,8 @@ struct BackupInfo {
 
   BackupInfo() {}
 
-  BackupInfo(BackupID _backup_id, int64_t _timestamp, uint64_t _size,
-             uint32_t _number_files, const std::string& _app_metadata)
+  explicit BackupInfo(BackupID _backup_id, int64_t _timestamp, uint64_t _size,
+                      uint32_t _number_files, const std::string& _app_metadata)
       : backup_id(_backup_id),
         timestamp(_timestamp),
         size(_size),
@@ -364,8 +469,8 @@ class BackupStatistics {
     number_fail_backup = 0;
   }
 
-  BackupStatistics(uint32_t _number_success_backup,
-                   uint32_t _number_fail_backup)
+  explicit BackupStatistics(uint32_t _number_success_backup,
+                            uint32_t _number_fail_backup)
       : number_success_backup(_number_success_backup),
         number_fail_backup(_number_fail_backup) {}
 
@@ -462,6 +567,9 @@ class BackupEngineReadOnlyBase {
   // Returns Status::OK() if all checks are good
   virtual IOStatus VerifyBackup(BackupID backup_id,
                                 bool verify_with_checksum = false) const = 0;
+
+  // Internal use only
+  virtual BackupEngine* AsBackupEngine() = 0;
 };
 
 // Append-only functions of a BackupEngine. See BackupEngine comment for
@@ -628,4 +736,3 @@ class BackupEngineReadOnly : public BackupEngineReadOnlyBase {
 };
 
 }  // namespace ROCKSDB_NAMESPACE
-#endif  // ROCKSDB_LITE

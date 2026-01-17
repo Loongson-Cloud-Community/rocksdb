@@ -9,20 +9,22 @@
 #include <cstddef>
 #include <memory>
 
+#include "cache/cache_reservation_manager.h"
 #include "cache/lru_cache.h"
-#include "memory/memory_allocator.h"
+#include "memory/memory_allocator_impl.h"
 #include "rocksdb/secondary_cache.h"
 #include "rocksdb/slice.h"
 #include "rocksdb/status.h"
 #include "util/compression.h"
+#include "util/mutexlock.h"
 
 namespace ROCKSDB_NAMESPACE {
 
 class CompressedSecondaryCacheResultHandle : public SecondaryCacheResultHandle {
  public:
-  CompressedSecondaryCacheResultHandle(void* value, size_t size)
+  CompressedSecondaryCacheResultHandle(Cache::ObjectPtr value, size_t size)
       : value_(value), size_(size) {}
-  virtual ~CompressedSecondaryCacheResultHandle() override = default;
+  ~CompressedSecondaryCacheResultHandle() override = default;
 
   CompressedSecondaryCacheResultHandle(
       const CompressedSecondaryCacheResultHandle&) = delete;
@@ -33,12 +35,12 @@ class CompressedSecondaryCacheResultHandle : public SecondaryCacheResultHandle {
 
   void Wait() override {}
 
-  void* Value() override { return value_; }
+  Cache::ObjectPtr Value() override { return value_; }
 
   size_t Size() override { return size_; }
 
  private:
-  void* value_;
+  Cache::ObjectPtr value_;
   size_t size_;
 };
 
@@ -68,25 +70,23 @@ class CompressedSecondaryCacheResultHandle : public SecondaryCacheResultHandle {
 
 class CompressedSecondaryCache : public SecondaryCache {
  public:
-  CompressedSecondaryCache(
-      size_t capacity, int num_shard_bits, bool strict_capacity_limit,
-      double high_pri_pool_ratio, double low_pri_pool_ratio,
-      std::shared_ptr<MemoryAllocator> memory_allocator = nullptr,
-      bool use_adaptive_mutex = kDefaultToAdaptiveMutex,
-      CacheMetadataChargePolicy metadata_charge_policy =
-          kDefaultCacheMetadataChargePolicy,
-      CompressionType compression_type = CompressionType::kLZ4Compression,
-      uint32_t compress_format_version = 2);
-  virtual ~CompressedSecondaryCache() override;
+  explicit CompressedSecondaryCache(
+      const CompressedSecondaryCacheOptions& opts);
+  ~CompressedSecondaryCache() override;
 
   const char* Name() const override { return "CompressedSecondaryCache"; }
 
-  Status Insert(const Slice& key, void* value,
-                const Cache::CacheItemHelper* helper) override;
+  Status Insert(const Slice& key, Cache::ObjectPtr value,
+                const Cache::CacheItemHelper* helper,
+                bool force_insert) override;
+
+  Status InsertSaved(const Slice& key, const Slice& saved, CompressionType type,
+                     CacheTier source) override;
 
   std::unique_ptr<SecondaryCacheResultHandle> Lookup(
-      const Slice& key, const Cache::CreateCallback& create_cb, bool /*wait*/,
-      bool advise_erase, bool& is_in_sec_cache) override;
+      const Slice& key, const Cache::CacheItemHelper* helper,
+      Cache::CreateContext* create_context, bool /*wait*/, bool advise_erase,
+      Statistics* stats, bool& kept_in_sec_cache) override;
 
   bool SupportForceErase() const override { return true; }
 
@@ -94,14 +94,22 @@ class CompressedSecondaryCache : public SecondaryCache {
 
   void WaitAll(std::vector<SecondaryCacheResultHandle*> /*handles*/) override {}
 
+  Status SetCapacity(size_t capacity) override;
+
+  Status GetCapacity(size_t& capacity) override;
+
+  Status Deflate(size_t decrease) override;
+
+  Status Inflate(size_t increase) override;
+
   std::string GetPrintableOptions() const override;
 
+  size_t TEST_GetUsage() { return cache_->GetUsage(); }
+
  private:
-  friend class CompressedSecondaryCacheTest;
-  static constexpr std::array<uint16_t, 33> malloc_bin_sizes_{
-      32,   64,   96,   128,  160,  192,  224,   256,   320,   384,   448,
-      512,  640,  768,  896,  1024, 1280, 1536,  1792,  2048,  2560,  3072,
-      3584, 4096, 5120, 6144, 7168, 8192, 10240, 12288, 14336, 16384, 32768};
+  friend class CompressedSecondaryCacheTestBase;
+  static constexpr std::array<uint16_t, 8> malloc_bin_sizes_{
+      128, 256, 512, 1024, 2048, 4096, 8192, 16384};
 
   struct CacheValueChunk {
     // TODO try "CacheAllocationPtr next;".
@@ -117,7 +125,7 @@ class CompressedSecondaryCache : public SecondaryCache {
   // are stored in CacheValueChunk and extra charge is needed for each chunk,
   // so the cache charge is recalculated here.
   CacheValueChunk* SplitValueIntoChunks(const Slice& value,
-                                        const CompressionType compression_type,
+                                        CompressionType compression_type,
                                         size_t& charge);
 
   // After merging chunks, the extra charge for each chunk is removed, so
@@ -125,10 +133,21 @@ class CompressedSecondaryCache : public SecondaryCache {
   CacheAllocationPtr MergeChunksIntoValue(const void* chunks_head,
                                           size_t& charge);
 
-  // An implementation of Cache::DeleterFn.
-  static void DeletionCallback(const Slice& /*key*/, void* obj);
+  bool MaybeInsertDummy(const Slice& key);
+
+  Status InsertInternal(const Slice& key, Cache::ObjectPtr value,
+                        const Cache::CacheItemHelper* helper,
+                        CompressionType type, CacheTier source);
+
+  size_t TEST_GetCharge(const Slice& key);
+
+  // TODO: clean up to use cleaner interfaces in typed_cache.h
+  const Cache::CacheItemHelper* GetHelper(bool enable_custom_split_merge) const;
   std::shared_ptr<Cache> cache_;
   CompressedSecondaryCacheOptions cache_options_;
+  mutable port::Mutex capacity_mutex_;
+  std::shared_ptr<ConcurrentCacheReservationManager> cache_res_mgr_;
+  bool disable_cache_;
 };
 
 }  // namespace ROCKSDB_NAMESPACE

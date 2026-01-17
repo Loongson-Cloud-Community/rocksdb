@@ -3,8 +3,6 @@
 //  COPYING file in the root directory) and Apache 2.0 License
 //  (found in the LICENSE.Apache file in the root directory).
 
-#ifndef ROCKSDB_LITE
-
 #include "db/compaction/compaction_job.h"
 
 #include <algorithm>
@@ -19,7 +17,9 @@
 #include "db/db_impl/db_impl.h"
 #include "db/error_handler.h"
 #include "db/version_set.h"
+#include "file/random_access_file_reader.h"
 #include "file/writable_file_writer.h"
+#include "options/options_helper.h"
 #include "rocksdb/cache.h"
 #include "rocksdb/convenience.h"
 #include "rocksdb/db.h"
@@ -38,7 +38,7 @@ namespace ROCKSDB_NAMESPACE {
 namespace {
 
 void VerifyInitializationOfCompactionJobStats(
-      const CompactionJobStats& compaction_job_stats) {
+    const CompactionJobStats& compaction_job_stats) {
 #if !defined(IOS_CROSS_COMPILE)
   ASSERT_EQ(compaction_job_stats.elapsed_micros, 0U);
 
@@ -49,7 +49,8 @@ void VerifyInitializationOfCompactionJobStats(
   ASSERT_EQ(compaction_job_stats.num_output_records, 0U);
   ASSERT_EQ(compaction_job_stats.num_output_files, 0U);
 
-  ASSERT_EQ(compaction_job_stats.is_manual_compaction, true);
+  ASSERT_TRUE(compaction_job_stats.is_manual_compaction);
+  ASSERT_FALSE(compaction_job_stats.is_remote_compaction);
 
   ASSERT_EQ(compaction_job_stats.total_input_bytes, 0U);
   ASSERT_EQ(compaction_job_stats.total_output_bytes, 0U);
@@ -194,13 +195,15 @@ class MockTestFileSystem : public FileSystemWrapper {
   Env::IOPriority write_io_priority_;
 };
 
+enum TableTypeForTest : uint8_t { kMockTable = 0, kBlockBasedTable = 1 };
+
 }  // namespace
 
 class CompactionJobTestBase : public testing::Test {
  protected:
   CompactionJobTestBase(std::string dbname, const Comparator* ucmp,
                         std::function<std::string(uint64_t)> encode_u64_ts,
-                        bool test_io_priority)
+                        bool test_io_priority, TableTypeForTest table_type)
       : dbname_(std::move(dbname)),
         ucmp_(ucmp),
         db_options_(),
@@ -212,17 +215,23 @@ class CompactionJobTestBase : public testing::Test {
             dbname_, &db_options_, env_options_, table_cache_.get(),
             &write_buffer_manager_, &write_controller_,
             /*block_cache_tracer=*/nullptr,
-            /*io_tracer=*/nullptr, /*db_id*/ "", /*db_session_id*/ "")),
+            /*io_tracer=*/nullptr, /*db_id=*/"", /*db_session_id=*/"",
+            /*daily_offpeak_time_utc=*/"",
+            /*error_handler=*/nullptr, /*read_only=*/false)),
         shutting_down_(false),
         mock_table_factory_(new mock::MockTableFactory()),
         error_handler_(nullptr, db_options_, &mutex_),
         encode_u64_ts_(std::move(encode_u64_ts)),
-        test_io_priority_(test_io_priority) {
+        test_io_priority_(test_io_priority),
+        table_type_(table_type) {
     Env* base_env = Env::Default();
     EXPECT_OK(
         test::CreateEnvFromSystem(ConfigOptions(), &base_env, &env_guard_));
     env_ = base_env;
     fs_ = env_->GetFileSystem();
+    // set default for the tests
+    mutable_cf_options_.target_file_size_base = 1024 * 1024;
+    mutable_cf_options_.max_compaction_bytes = 10 * 1024 * 1024;
   }
 
   void SetUp() override {
@@ -232,12 +241,15 @@ class CompactionJobTestBase : public testing::Test {
     db_options_.db_paths.emplace_back(dbname_,
                                       std::numeric_limits<uint64_t>::max());
     cf_options_.comparator = ucmp_;
-    if (test_io_priority_) {
+    if (table_type_ == TableTypeForTest::kBlockBasedTable) {
       BlockBasedTableOptions table_options;
       cf_options_.table_factory.reset(NewBlockBasedTableFactory(table_options));
-    } else {
+    } else if (table_type_ == TableTypeForTest::kMockTable) {
       cf_options_.table_factory = mock_table_factory_;
+    } else {
+      assert(false);
     }
+    mutable_cf_options_.table_factory = cf_options_.table_factory;
   }
 
   std::string GenerateFileName(uint64_t file_number) {
@@ -284,17 +296,20 @@ class CompactionJobTestBase : public testing::Test {
     Status s = WritableFileWriter::Create(fs_, table_name, FileOptions(),
                                           &file_writer, nullptr);
     ASSERT_OK(s);
+    const ReadOptions read_options;
+    const WriteOptions write_options;
     std::unique_ptr<TableBuilder> table_builder(
         cf_options_.table_factory->NewTableBuilder(
-            TableBuilderOptions(*cfd_->ioptions(), mutable_cf_options_,
-                                cfd_->internal_comparator(),
-                                cfd_->int_tbl_prop_collector_factories(),
-                                CompressionType::kNoCompression,
-                                CompressionOptions(), 0 /* column_family_id */,
-                                kDefaultColumnFamilyName, -1 /* level */),
+            TableBuilderOptions(
+                cfd_->ioptions(), mutable_cf_options_, read_options,
+                write_options, cfd_->internal_comparator(),
+                cfd_->internal_tbl_prop_coll_factories(),
+                CompressionType::kNoCompression, CompressionOptions(),
+                0 /* column_family_id */, kDefaultColumnFamilyName,
+                -1 /* level */, kUnknownNewestKeyTime),
             file_writer.get()));
     // Build table.
-    for (auto kv : contents) {
+    for (const auto& kv : contents) {
       std::string key;
       std::string value;
       std::tie(key, value) = kv;
@@ -313,7 +328,7 @@ class CompactionJobTestBase : public testing::Test {
     SequenceNumber smallest_seqno = kMaxSequenceNumber;
     SequenceNumber largest_seqno = 0;
     uint64_t oldest_blob_file_number = kInvalidBlobFileNumber;
-    for (auto kv : contents) {
+    for (const auto& kv : contents) {
       ParsedInternalKey key;
       std::string skey;
       std::string value;
@@ -358,27 +373,113 @@ class CompactionJobTestBase : public testing::Test {
 
     uint64_t file_number = versions_->NewFileNumber();
 
-    uint64_t file_size;
-    if (test_io_priority_) {
+    uint64_t file_size = 0;
+    if (table_type_ == TableTypeForTest::kBlockBasedTable) {
       CreateTable(GenerateFileName(file_number), contents, file_size);
-    } else {
+    } else if (table_type_ == TableTypeForTest::kMockTable) {
       file_size = 10;
       EXPECT_OK(mock_table_factory_->CreateMockTable(
-          env_, GenerateFileName(file_number), std::move(contents)));
+          env_, GenerateFileName(file_number), contents));
+    } else {
+      assert(false);
     }
 
     VersionEdit edit;
-    edit.AddFile(level, file_number, 0, file_size, smallest_key, largest_key,
-                 smallest_seqno, largest_seqno, false, Temperature::kUnknown,
-                 oldest_blob_file_number, kUnknownOldestAncesterTime,
-                 kUnknownFileCreationTime, kUnknownFileChecksum,
-                 kUnknownFileChecksumFuncName, kNullUniqueId64x2);
+    edit.AddFile(
+        level, file_number, 0, file_size, smallest_key, largest_key,
+        smallest_seqno, largest_seqno, false, Temperature::kUnknown,
+        oldest_blob_file_number, kUnknownOldestAncesterTime,
+        kUnknownFileCreationTime,
+        versions_->GetColumnFamilySet()->GetDefault()->NewEpochNumber(),
+        kUnknownFileChecksum, kUnknownFileChecksumFuncName, kNullUniqueId64x2,
+        /*compensated_range_deletion_size=*/0, /*tail_size=*/0,
+        /*user_defined_timestamps_persisted=*/true);
 
     mutex_.Lock();
-    EXPECT_OK(
-        versions_->LogAndApply(versions_->GetColumnFamilySet()->GetDefault(),
-                               mutable_cf_options_, &edit, &mutex_, nullptr));
+    EXPECT_OK(versions_->LogAndApply(
+        versions_->GetColumnFamilySet()->GetDefault(), read_options_,
+        write_options_, &edit, &mutex_, nullptr));
     mutex_.Unlock();
+  }
+
+  void VerifyTables(int output_level,
+                    const std::vector<mock::KVVector>& expected_results,
+                    std::vector<uint64_t> expected_oldest_blob_file_numbers) {
+    if (expected_results.empty()) {
+      ASSERT_EQ(compaction_job_stats_.num_output_files, 0U);
+      return;
+    }
+    int expected_output_file_num = 0;
+    for (const auto& e : expected_results) {
+      if (!e.empty()) {
+        ++expected_output_file_num;
+      }
+    }
+    ASSERT_EQ(expected_output_file_num, compaction_job_stats_.num_output_files);
+    if (expected_output_file_num == 0) {
+      return;
+    }
+
+    if (expected_oldest_blob_file_numbers.empty()) {
+      expected_oldest_blob_file_numbers.resize(expected_output_file_num,
+                                               kInvalidBlobFileNumber);
+    }
+
+    auto cfd = versions_->GetColumnFamilySet()->GetDefault();
+    if (table_type_ == TableTypeForTest::kMockTable) {
+      ASSERT_EQ(compaction_job_stats_.num_output_files,
+                expected_results.size());
+      mock_table_factory_->AssertLatestFiles(expected_results);
+    } else {
+      assert(table_type_ == TableTypeForTest::kBlockBasedTable);
+    }
+
+    auto output_files =
+        cfd->current()->storage_info()->LevelFiles(output_level);
+    ASSERT_EQ(expected_output_file_num, output_files.size());
+
+    if (table_type_ == TableTypeForTest::kMockTable) {
+      assert(output_files.size() ==
+             static_cast<size_t>(expected_output_file_num));
+      const FileMetaData* const output_file = output_files[0];
+      ASSERT_EQ(output_file->oldest_blob_file_number,
+                expected_oldest_blob_file_numbers[0]);
+      return;
+    }
+
+    for (size_t i = 0; i < expected_results.size(); ++i) {
+      const FileMetaData* const output_file = output_files[i];
+      std::string file_name = GenerateFileName(output_file->fd.GetNumber());
+      const auto& fs = env_->GetFileSystem();
+      std::unique_ptr<RandomAccessFileReader> freader;
+      IOStatus ios = RandomAccessFileReader::Create(
+          fs, file_name, FileOptions(), &freader, nullptr);
+      ASSERT_OK(ios);
+      std::unique_ptr<TableReader> table_reader;
+      uint64_t file_size = output_file->fd.GetFileSize();
+      ReadOptions read_opts;
+      Status s = cf_options_.table_factory->NewTableReader(
+          read_opts,
+          TableReaderOptions(cfd->ioptions(), nullptr, FileOptions(),
+                             cfd_->internal_comparator(),
+                             0 /* block_protection_bytes_per_key */),
+          std::move(freader), file_size, &table_reader, false);
+      ASSERT_OK(s);
+      assert(table_reader);
+      std::unique_ptr<InternalIterator> iiter(
+          table_reader->NewIterator(read_opts, nullptr, nullptr, true,
+                                    TableReaderCaller::kUncategorized));
+      assert(iiter);
+
+      mock::KVVector from_db;
+      for (iiter->SeekToFirst(); iiter->Valid(); iiter->Next()) {
+        const Slice key = iiter->key();
+        const Slice value = iiter->value();
+        from_db.emplace_back(
+            make_pair(key.ToString(false), value.ToString(false)));
+      }
+      ASSERT_EQ(expected_results[i], from_db);
+    }
   }
 
   void SetLastSequence(const SequenceNumber sequence_number) {
@@ -408,8 +509,7 @@ class CompactionJobTestBase : public testing::Test {
 
         // This is how the key will look like once it's written in bottommost
         // file
-        InternalKey bottommost_internal_key(
-            key, 0, kTypeValue);
+        InternalKey bottommost_internal_key(key, 0, kTypeValue);
 
         if (corrupt_id(k)) {
           test::CorruptKeyType(&internal_key);
@@ -439,13 +539,21 @@ class CompactionJobTestBase : public testing::Test {
   void NewDB() {
     EXPECT_OK(DestroyDB(dbname_, Options()));
     EXPECT_OK(env_->CreateDirIfMissing(dbname_));
+
+    std::shared_ptr<Logger> info_log;
+    DBOptions db_opts = BuildDBOptions(db_options_, mutable_db_options_);
+    Status s = CreateLoggerFromOptions(dbname_, db_opts, &info_log);
+    ASSERT_OK(s);
+    db_options_.info_log = info_log;
+
     versions_.reset(
         new VersionSet(dbname_, &db_options_, env_options_, table_cache_.get(),
                        &write_buffer_manager_, &write_controller_,
                        /*block_cache_tracer=*/nullptr, /*io_tracer=*/nullptr,
-                       /*db_id*/ "", /*db_session_id*/ ""));
+                       test::kUnitTestDbId, /*db_session_id=*/"",
+                       /*daily_offpeak_time_utc=*/"",
+                       /*error_handler=*/nullptr, /*read_only=*/false));
     compaction_job_stats_.Reset();
-    ASSERT_OK(SetIdentityFile(env_, dbname_));
 
     VersionEdit new_db;
     new_db.SetLogNumber(0);
@@ -455,20 +563,21 @@ class CompactionJobTestBase : public testing::Test {
     const std::string manifest = DescriptorFileName(dbname_, 1);
     std::unique_ptr<WritableFileWriter> file_writer;
     const auto& fs = env_->GetFileSystem();
-    Status s = WritableFileWriter::Create(
-        fs, manifest, fs->OptimizeForManifestWrite(env_options_), &file_writer,
-        nullptr);
+    s = WritableFileWriter::Create(fs, manifest,
+                                   fs->OptimizeForManifestWrite(env_options_),
+                                   &file_writer, nullptr);
 
     ASSERT_OK(s);
     {
       log::Writer log(std::move(file_writer), 0, false);
       std::string record;
       new_db.EncodeTo(&record);
-      s = log.AddRecord(record);
+      s = log.AddRecord(WriteOptions(), record);
     }
     ASSERT_OK(s);
     // Make "CURRENT" file that points to the new manifest file.
-    s = SetCurrentFile(fs_.get(), dbname_, 1, nullptr);
+    s = SetCurrentFile(WriteOptions(), fs_.get(), dbname_, 1,
+                       Temperature::kUnknown, nullptr);
 
     ASSERT_OK(s);
 
@@ -481,27 +590,32 @@ class CompactionJobTestBase : public testing::Test {
     cfd_ = versions_->GetColumnFamilySet()->GetDefault();
   }
 
+  // input_files[i] on input_levels[i]
   void RunLastLevelCompaction(
       const std::vector<std::vector<FileMetaData*>>& input_files,
+      const std::vector<int> input_levels,
       std::function<void(Compaction& comp)>&& verify_func,
       const std::vector<SequenceNumber>& snapshots = {}) {
     const int kLastLevel = cf_options_.num_levels - 1;
     verify_per_key_placement_ = std::move(verify_func);
     mock::KVVector empty_map;
-    RunCompaction(input_files, empty_map, snapshots, kMaxSequenceNumber,
-                  kLastLevel, false);
+    RunCompaction(input_files, input_levels, {empty_map}, snapshots,
+                  kMaxSequenceNumber, kLastLevel, false);
   }
 
+  // input_files[i] on input_levels[i]
   void RunCompaction(
       const std::vector<std::vector<FileMetaData*>>& input_files,
-      const mock::KVVector& expected_results,
+      const std::vector<int>& input_levels,
+      const std::vector<mock::KVVector>& expected_results,
       const std::vector<SequenceNumber>& snapshots = {},
       SequenceNumber earliest_write_conflict_snapshot = kMaxSequenceNumber,
       int output_level = 1, bool verify = true,
-      uint64_t expected_oldest_blob_file_number = kInvalidBlobFileNumber,
+      std::vector<uint64_t> expected_oldest_blob_file_numbers = {},
       bool check_get_priority = false,
       Env::IOPriority read_io_priority = Env::IO_TOTAL,
-      Env::IOPriority write_io_priority = Env::IO_TOTAL) {
+      Env::IOPriority write_io_priority = Env::IO_TOTAL,
+      int max_subcompactions = 0) {
     // For compaction, set fs as MockTestFileSystem to check the io_priority.
     if (test_io_priority_) {
       db_options_.fs.reset(
@@ -512,24 +626,36 @@ class CompactionJobTestBase : public testing::Test {
 
     size_t num_input_files = 0;
     std::vector<CompactionInputFiles> compaction_input_files;
-    for (size_t level = 0; level < input_files.size(); level++) {
-      auto level_files = input_files[level];
+    for (size_t i = 0; i < input_files.size(); ++i) {
+      auto level_files = input_files[i];
       CompactionInputFiles compaction_level;
-      compaction_level.level = static_cast<int>(level);
+      compaction_level.level = input_levels[i];
       compaction_level.files.insert(compaction_level.files.end(),
-          level_files.begin(), level_files.end());
+                                    level_files.begin(), level_files.end());
       compaction_input_files.push_back(compaction_level);
       num_input_files += level_files.size();
     }
 
-    Compaction compaction(
-        cfd->current()->storage_info(), *cfd->ioptions(),
-        *cfd->GetLatestMutableCFOptions(), mutable_db_options_,
-        compaction_input_files, output_level, 1024 * 1024, 10 * 1024 * 1024, 0,
-        kNoCompression, cfd->GetLatestMutableCFOptions()->compression_opts,
-        Temperature::kUnknown, 0, {}, true);
-    compaction.SetInputVersion(cfd->current());
+    std::vector<FileMetaData*> grandparents;
+    // it should actually be the next non-empty level
+    const int kGrandparentsLevel = output_level + 1;
+    if (kGrandparentsLevel < cf_options_.num_levels) {
+      grandparents =
+          cfd_->current()->storage_info()->LevelFiles(kGrandparentsLevel);
+    }
 
+    Compaction compaction(
+        cfd->current()->storage_info(), cfd->ioptions(),
+        cfd->GetLatestMutableCFOptions(), mutable_db_options_,
+        compaction_input_files, output_level,
+        mutable_cf_options_.target_file_size_base,
+        mutable_cf_options_.max_compaction_bytes, 0, kNoCompression,
+        cfd->GetLatestMutableCFOptions().compression_opts,
+        Temperature::kUnknown, max_subcompactions, grandparents,
+        /*earliest_snapshot*/ std::nullopt, /*snapshot_checker*/ nullptr, true);
+    compaction.FinalizeInputInfo(cfd->current());
+
+    assert(db_options_.info_log);
     LogBuffer log_buffer(InfoLogLevel::INFO_LEVEL, db_options_.info_log.get());
     mutex_.Lock();
     EventLogger event_logger(db_options_.info_log.get());
@@ -538,11 +664,12 @@ class CompactionJobTestBase : public testing::Test {
     ASSERT_TRUE(full_history_ts_low_.empty() ||
                 ucmp_->timestamp_size() == full_history_ts_low_.size());
     const std::atomic<bool> kManualCompactionCanceledFalse{false};
+    JobContext job_context(1, false /* create_superversion */);
     CompactionJob compaction_job(
         0, &compaction, db_options_, mutable_db_options_, env_options_,
         versions_.get(), &shutting_down_, &log_buffer, nullptr, nullptr,
         nullptr, nullptr, &mutex_, &error_handler_, snapshots,
-        earliest_write_conflict_snapshot, snapshot_checker, nullptr,
+        earliest_write_conflict_snapshot, snapshot_checker, &job_context,
         table_cache_, &event_logger, false, false, dbname_,
         &compaction_job_stats_, Env::Priority::USER, nullptr /* IOTracer */,
         /*manual_compaction_canceled=*/kManualCompactionCanceledFalse,
@@ -550,32 +677,24 @@ class CompactionJobTestBase : public testing::Test {
         full_history_ts_low_);
     VerifyInitializationOfCompactionJobStats(compaction_job_stats_);
 
-    compaction_job.Prepare();
+    compaction_job.Prepare(std::nullopt /*subcompact to be computed*/);
     mutex_.Unlock();
     Status s = compaction_job.Run();
     ASSERT_OK(s);
     ASSERT_OK(compaction_job.io_status());
     mutex_.Lock();
-    ASSERT_OK(compaction_job.Install(*cfd->GetLatestMutableCFOptions()));
+    bool compaction_released = false;
+    ASSERT_OK(compaction_job.Install(&compaction_released));
     ASSERT_OK(compaction_job.io_status());
     mutex_.Unlock();
+    log_buffer.FlushBufferToLog();
 
     if (verify) {
       ASSERT_GE(compaction_job_stats_.elapsed_micros, 0U);
       ASSERT_EQ(compaction_job_stats_.num_input_files, num_input_files);
 
-      if (expected_results.empty()) {
-        ASSERT_EQ(compaction_job_stats_.num_output_files, 0U);
-      } else {
-        ASSERT_EQ(compaction_job_stats_.num_output_files, 1U);
-        mock_table_factory_->AssertLatestFile(expected_results);
-
-        auto output_files =
-            cfd->current()->storage_info()->LevelFiles(output_level);
-        ASSERT_EQ(output_files.size(), 1);
-        ASSERT_EQ(output_files[0]->oldest_blob_file_number,
-                  expected_oldest_blob_file_number);
-      }
+      VerifyTables(output_level, expected_results,
+                   expected_oldest_blob_file_numbers);
     }
 
     if (check_get_priority) {
@@ -621,6 +740,8 @@ class CompactionJobTestBase : public testing::Test {
   ColumnFamilyOptions cf_options_;
   MutableCFOptions mutable_cf_options_;
   MutableDBOptions mutable_db_options_;
+  const ReadOptions read_options_;
+  const WriteOptions write_options_;
   std::shared_ptr<Cache> table_cache_;
   WriteController write_controller_;
   WriteBufferManager write_buffer_manager_;
@@ -635,8 +756,9 @@ class CompactionJobTestBase : public testing::Test {
   ErrorHandler error_handler_;
   std::string full_history_ts_low_;
   const std::function<std::string(uint64_t)> encode_u64_ts_;
-  bool test_io_priority_;
+  const bool test_io_priority_;
   std::function<void(Compaction& comp)> verify_per_key_placement_;
+  const TableTypeForTest table_type_ = kMockTable;
 };
 
 // TODO(icanadi) Make it simpler once we mock out VersionSet
@@ -645,7 +767,8 @@ class CompactionJobTest : public CompactionJobTestBase {
   CompactionJobTest()
       : CompactionJobTestBase(
             test::PerThreadDBPath("compaction_job_test"), BytewiseComparator(),
-            [](uint64_t /*ts*/) { return ""; }, false) {}
+            [](uint64_t /*ts*/) { return ""; }, /*test_io_priority=*/false,
+            TableTypeForTest::kMockTable) {}
 };
 
 TEST_F(CompactionJobTest, Simple) {
@@ -653,9 +776,10 @@ TEST_F(CompactionJobTest, Simple) {
 
   auto expected_results = CreateTwoFiles(false);
   auto cfd = versions_->GetColumnFamilySet()->GetDefault();
-  auto files = cfd->current()->storage_info()->LevelFiles(0);
+  constexpr int input_level = 0;
+  auto files = cfd->current()->storage_info()->LevelFiles(input_level);
   ASSERT_EQ(2U, files.size());
-  RunCompaction({ files }, expected_results);
+  RunCompaction({files}, {input_level}, {expected_results});
 }
 
 TEST_F(CompactionJobTest, DISABLED_SimpleCorrupted) {
@@ -663,8 +787,9 @@ TEST_F(CompactionJobTest, DISABLED_SimpleCorrupted) {
 
   auto expected_results = CreateTwoFiles(true);
   auto cfd = versions_->GetColumnFamilySet()->GetDefault();
-  auto files = cfd->current()->storage_info()->LevelFiles(0);
-  RunCompaction({files}, expected_results);
+  constexpr int input_level = 0;
+  auto files = cfd->current()->storage_info()->LevelFiles(input_level);
+  RunCompaction({files}, {input_level}, {expected_results});
   ASSERT_EQ(compaction_job_stats_.num_corrupt_keys, 400U);
 }
 
@@ -683,8 +808,9 @@ TEST_F(CompactionJobTest, SimpleDeletion) {
       mock::MakeMockFile({{KeyStr("b", 0U, kTypeValue), "val"}});
 
   SetLastSequence(4U);
-  auto files = cfd_->current()->storage_info()->LevelFiles(0);
-  RunCompaction({files}, expected_results);
+  constexpr int input_level = 0;
+  auto files = cfd_->current()->storage_info()->LevelFiles(input_level);
+  RunCompaction({files}, {input_level}, {expected_results});
 }
 
 TEST_F(CompactionJobTest, OutputNothing) {
@@ -701,8 +827,10 @@ TEST_F(CompactionJobTest, OutputNothing) {
   auto expected_results = mock::MakeMockFile();
 
   SetLastSequence(4U);
-  auto files = cfd_->current()->storage_info()->LevelFiles(0);
-  RunCompaction({files}, expected_results);
+
+  constexpr int input_level = 0;
+  auto files = cfd_->current()->storage_info()->LevelFiles(input_level);
+  RunCompaction({files}, {input_level}, {expected_results});
 }
 
 TEST_F(CompactionJobTest, SimpleOverwrite) {
@@ -723,8 +851,9 @@ TEST_F(CompactionJobTest, SimpleOverwrite) {
                           {KeyStr("b", 0U, kTypeValue), "val3"}});
 
   SetLastSequence(4U);
-  auto files = cfd_->current()->storage_info()->LevelFiles(0);
-  RunCompaction({files}, expected_results);
+  constexpr int input_level = 0;
+  auto files = cfd_->current()->storage_info()->LevelFiles(input_level);
+  RunCompaction({files}, {input_level}, {expected_results});
 }
 
 TEST_F(CompactionJobTest, SimpleNonLastLevel) {
@@ -751,9 +880,12 @@ TEST_F(CompactionJobTest, SimpleNonLastLevel) {
                           {KeyStr("b", 6U, kTypeValue), "val3"}});
 
   SetLastSequence(6U);
-  auto lvl0_files = cfd_->current()->storage_info()->LevelFiles(0);
-  auto lvl1_files = cfd_->current()->storage_info()->LevelFiles(1);
-  RunCompaction({lvl0_files, lvl1_files}, expected_results);
+  const std::vector<int> input_levels = {0, 1};
+  auto lvl0_files =
+      cfd_->current()->storage_info()->LevelFiles(input_levels[0]);
+  auto lvl1_files =
+      cfd_->current()->storage_info()->LevelFiles(input_levels[1]);
+  RunCompaction({lvl0_files, lvl1_files}, input_levels, {expected_results});
 }
 
 TEST_F(CompactionJobTest, SimpleMerge) {
@@ -776,8 +908,9 @@ TEST_F(CompactionJobTest, SimpleMerge) {
                           {KeyStr("b", 0U, kTypeValue), "1,2"}});
 
   SetLastSequence(5U);
-  auto files = cfd_->current()->storage_info()->LevelFiles(0);
-  RunCompaction({files}, expected_results);
+  constexpr int input_level = 0;
+  auto files = cfd_->current()->storage_info()->LevelFiles(input_level);
+  RunCompaction({files}, {input_level}, {expected_results});
 }
 
 TEST_F(CompactionJobTest, NonAssocMerge) {
@@ -800,8 +933,9 @@ TEST_F(CompactionJobTest, NonAssocMerge) {
                           {KeyStr("b", 0U, kTypeValue), "1,2"}});
 
   SetLastSequence(5U);
-  auto files = cfd_->current()->storage_info()->LevelFiles(0);
-  RunCompaction({files}, expected_results);
+  constexpr int input_level = 0;
+  auto files = cfd_->current()->storage_info()->LevelFiles(input_level);
+  RunCompaction({files}, {input_level}, {expected_results});
 }
 
 // Filters merge operands with value 10.
@@ -827,8 +961,9 @@ TEST_F(CompactionJobTest, MergeOperandFilter) {
                           {KeyStr("b", 0U, kTypeValue), test::EncodeInt(2U)}});
 
   SetLastSequence(5U);
-  auto files = cfd_->current()->storage_info()->LevelFiles(0);
-  RunCompaction({files}, expected_results);
+  constexpr int input_level = 0;
+  auto files = cfd_->current()->storage_info()->LevelFiles(input_level);
+  RunCompaction({files}, {input_level}, {expected_results});
 }
 
 TEST_F(CompactionJobTest, FilterSomeMergeOperands) {
@@ -863,8 +998,9 @@ TEST_F(CompactionJobTest, FilterSomeMergeOperands) {
   });
 
   SetLastSequence(5U);
-  auto files = cfd_->current()->storage_info()->LevelFiles(0);
-  RunCompaction({files}, expected_results);
+  constexpr int input_level = 0;
+  auto files = cfd_->current()->storage_info()->LevelFiles(input_level);
+  RunCompaction({files}, {input_level}, {expected_results});
 }
 
 // Test where all operands/merge results are filtered out.
@@ -897,10 +1033,11 @@ TEST_F(CompactionJobTest, FilterAllMergeOperands) {
   AddMockFile(file3, 2);
 
   SetLastSequence(11U);
-  auto files = cfd_->current()->storage_info()->LevelFiles(0);
+  constexpr int input_level = 0;
+  auto files = cfd_->current()->storage_info()->LevelFiles(input_level);
 
   mock::KVVector empty_map;
-  RunCompaction({files}, empty_map);
+  RunCompaction({files}, {input_level}, {empty_map});
 }
 
 TEST_F(CompactionJobTest, SimpleSingleDelete) {
@@ -925,8 +1062,9 @@ TEST_F(CompactionJobTest, SimpleSingleDelete) {
       mock::MakeMockFile({{KeyStr("a", 5U, kTypeDeletion), ""}});
 
   SetLastSequence(6U);
-  auto files = cfd_->current()->storage_info()->LevelFiles(0);
-  RunCompaction({files}, expected_results);
+  constexpr int input_level = 0;
+  auto files = cfd_->current()->storage_info()->LevelFiles(input_level);
+  RunCompaction({files}, {input_level}, {expected_results});
 }
 
 TEST_F(CompactionJobTest, SingleDeleteSnapshots) {
@@ -990,8 +1128,9 @@ TEST_F(CompactionJobTest, SingleDeleteSnapshots) {
   });
 
   SetLastSequence(22U);
-  auto files = cfd_->current()->storage_info()->LevelFiles(0);
-  RunCompaction({files}, expected_results, {10U, 20U}, 10U);
+  constexpr int input_level = 0;
+  auto files = cfd_->current()->storage_info()->LevelFiles(input_level);
+  RunCompaction({files}, {input_level}, {expected_results}, {10U, 20U}, 10U);
 }
 
 TEST_F(CompactionJobTest, EarliestWriteConflictSnapshot) {
@@ -1068,8 +1207,10 @@ TEST_F(CompactionJobTest, EarliestWriteConflictSnapshot) {
   });
 
   SetLastSequence(24U);
-  auto files = cfd_->current()->storage_info()->LevelFiles(0);
-  RunCompaction({files}, expected_results, {10U, 20U, 30U}, 20U);
+  constexpr int input_level = 0;
+  auto files = cfd_->current()->storage_info()->LevelFiles(input_level);
+  RunCompaction({files}, {input_level}, {expected_results}, {10U, 20U, 30U},
+                20U);
 }
 
 TEST_F(CompactionJobTest, SingleDeleteZeroSeq) {
@@ -1091,8 +1232,9 @@ TEST_F(CompactionJobTest, SingleDeleteZeroSeq) {
   });
 
   SetLastSequence(22U);
-  auto files = cfd_->current()->storage_info()->LevelFiles(0);
-  RunCompaction({files}, expected_results, {});
+  constexpr int input_level = 0;
+  auto files = cfd_->current()->storage_info()->LevelFiles(input_level);
+  RunCompaction({files}, {input_level}, {expected_results}, {});
 }
 
 TEST_F(CompactionJobTest, MultiSingleDelete) {
@@ -1246,8 +1388,9 @@ TEST_F(CompactionJobTest, MultiSingleDelete) {
                           {KeyStr("M", 3U, kTypeSingleDeletion), ""}});
 
   SetLastSequence(22U);
-  auto files = cfd_->current()->storage_info()->LevelFiles(0);
-  RunCompaction({files}, expected_results, {10U}, 10U);
+  constexpr int input_level = 0;
+  auto files = cfd_->current()->storage_info()->LevelFiles(input_level);
+  RunCompaction({files}, {input_level}, {expected_results}, {10U}, 10U);
 }
 
 // This test documents the behavior where a corrupt key follows a deletion or a
@@ -1276,8 +1419,9 @@ TEST_F(CompactionJobTest, DISABLED_CorruptionAfterDeletion) {
                           {test::KeyStr("c", 0U, kTypeValue), "val2"}});
 
   SetLastSequence(6U);
-  auto files = cfd_->current()->storage_info()->LevelFiles(0);
-  RunCompaction({files}, expected_results);
+  constexpr int input_level = 0;
+  auto files = cfd_->current()->storage_info()->LevelFiles(input_level);
+  RunCompaction({files}, {input_level}, {expected_results});
 }
 
 TEST_F(CompactionJobTest, OldestBlobFileNumber) {
@@ -1322,14 +1466,16 @@ TEST_F(CompactionJobTest, OldestBlobFileNumber) {
                           expected_blob4, expected_blob5, expected_blob6});
 
   SetLastSequence(6U);
-  auto files = cfd_->current()->storage_info()->LevelFiles(0);
-  RunCompaction({files}, expected_results, std::vector<SequenceNumber>(),
-                kMaxSequenceNumber, /* output_level */ 1, /* verify */ true,
-                /* expected_oldest_blob_file_number */ 19);
+  constexpr int input_level = 0;
+  auto files = cfd_->current()->storage_info()->LevelFiles(input_level);
+  RunCompaction({files}, {input_level}, {expected_results},
+                std::vector<SequenceNumber>(), kMaxSequenceNumber,
+                /* output_level */ 1, /* verify */ true,
+                /* expected_oldest_blob_file_numbers */ {19});
 }
 
 TEST_F(CompactionJobTest, VerifyPenultimateLevelOutput) {
-  cf_options_.bottommost_temperature = Temperature::kCold;
+  cf_options_.last_level_temperature = Temperature::kCold;
   SyncPoint::GetInstance()->SetCallBack(
       "Compaction::SupportsPerKeyPlacement:Enabled", [&](void* arg) {
         auto supports_per_key_placement = static_cast<bool*>(arg);
@@ -1377,21 +1523,22 @@ TEST_F(CompactionJobTest, VerifyPenultimateLevelOutput) {
   AddMockFile(file3_2, 3);
 
   auto cfd = versions_->GetColumnFamilySet()->GetDefault();
-  auto files0 = cfd->current()->storage_info()->LevelFiles(0);
-  auto files1 = cfd->current()->storage_info()->LevelFiles(1);
-  auto files2 = cfd->current()->storage_info()->LevelFiles(2);
-  auto files3 = cfd->current()->storage_info()->LevelFiles(3);
+  const std::vector<int> input_levels = {0, 1, 2, 3};
+  auto files0 = cfd->current()->storage_info()->LevelFiles(input_levels[0]);
+  auto files1 = cfd->current()->storage_info()->LevelFiles(input_levels[1]);
+  auto files2 = cfd->current()->storage_info()->LevelFiles(input_levels[2]);
+  auto files3 = cfd->current()->storage_info()->LevelFiles(input_levels[3]);
 
   RunLastLevelCompaction(
-      {files0, files1, files2, files3}, /*verify_func=*/[&](Compaction& comp) {
+      {files0, files1, files2, files3}, input_levels,
+      /*verify_func=*/[&](Compaction& comp) {
         for (char c = 'a'; c <= 'z'; c++) {
-          std::string c_str;
-          c_str = c;
-          const Slice key(c_str);
           if (c == 'a') {
-            ASSERT_FALSE(comp.WithinPenultimateLevelOutputRange(key));
+            comp.TEST_AssertWithinPenultimateLevelOutputRange(
+                "a", true /*expect_failure*/);
           } else {
-            ASSERT_TRUE(comp.WithinPenultimateLevelOutputRange(key));
+            std::string c_str{c};
+            comp.TEST_AssertWithinPenultimateLevelOutputRange(c_str);
           }
         }
       });
@@ -1408,8 +1555,9 @@ TEST_F(CompactionJobTest, NoEnforceSingleDeleteContract) {
   SetLastSequence(4U);
 
   auto expected_results = mock::MakeMockFile();
-  auto files = cfd_->current()->storage_info()->LevelFiles(0);
-  RunCompaction({files}, expected_results);
+  constexpr int input_level = 0;
+  auto files = cfd_->current()->storage_info()->LevelFiles(input_level);
+  RunCompaction({files}, {input_level}, {expected_results});
 }
 
 TEST_F(CompactionJobTest, InputSerialization) {
@@ -1418,17 +1566,7 @@ TEST_F(CompactionJobTest, InputSerialization) {
   const int kStrMaxLen = 1000;
   Random rnd(static_cast<uint32_t>(time(nullptr)));
   Random64 rnd64(time(nullptr));
-  input.column_family.name = rnd.RandomString(rnd.Uniform(kStrMaxLen));
-  input.column_family.options.comparator = ReverseBytewiseComparator();
-  input.column_family.options.max_bytes_for_level_base =
-      rnd64.Uniform(UINT64_MAX);
-  input.column_family.options.disable_auto_compactions = rnd.OneIn(2);
-  input.column_family.options.compression = kZSTD;
-  input.column_family.options.compression_opts.level = 4;
-  input.db_options.max_background_flushes = 10;
-  input.db_options.paranoid_checks = rnd.OneIn(2);
-  input.db_options.statistics = CreateDBStatistics();
-  input.db_options.env = env_;
+  input.cf_name = rnd.RandomString(rnd.Uniform(kStrMaxLen));
   while (!rnd.OneIn(10)) {
     input.snapshots.emplace_back(rnd64.Uniform(UINT64_MAX));
   }
@@ -1456,10 +1594,10 @@ TEST_F(CompactionJobTest, InputSerialization) {
   ASSERT_TRUE(deserialized1.TEST_Equals(&input));
 
   // Test mismatch
-  deserialized1.db_options.max_background_flushes += 10;
+  deserialized1.output_level += 10;
   std::string mismatch;
   ASSERT_FALSE(deserialized1.TEST_Equals(&input, &mismatch));
-  ASSERT_EQ(mismatch, "db_options.max_background_flushes");
+  ASSERT_EQ(mismatch, "output_level");
 
   // Test unknown field
   CompactionServiceInput deserialized2;
@@ -1515,20 +1653,40 @@ TEST_F(CompactionJobTest, ResultSerialization) {
   };
   result.status =
       status_list.at(rnd.Uniform(static_cast<int>(status_list.size())));
+
+  std::string file_checksum = rnd.RandomBinaryString(rnd.Uniform(kStrMaxLen));
+  std::string file_checksum_func_name = "MyAwesomeChecksumGenerator";
   while (!rnd.OneIn(10)) {
+    TableProperties tp;
+    tp.user_collected_properties.emplace(
+        "UCP_Key1", rnd.RandomString(rnd.Uniform(kStrMaxLen)));
+    tp.user_collected_properties.emplace(
+        "UCP_Key2", rnd.RandomString(rnd.Uniform(kStrMaxLen)));
+    tp.readable_properties.emplace("RP_Key1",
+                                   rnd.RandomString(rnd.Uniform(kStrMaxLen)));
+    tp.readable_properties.emplace("RP_K2y2",
+                                   rnd.RandomString(rnd.Uniform(kStrMaxLen)));
+
     UniqueId64x2 id{rnd64.Uniform(UINT64_MAX), rnd64.Uniform(UINT64_MAX)};
     result.output_files.emplace_back(
-        rnd.RandomString(rnd.Uniform(kStrMaxLen)), rnd64.Uniform(UINT64_MAX),
-        rnd64.Uniform(UINT64_MAX),
-        rnd.RandomBinaryString(rnd.Uniform(kStrMaxLen)),
-        rnd.RandomBinaryString(rnd.Uniform(kStrMaxLen)),
-        rnd64.Uniform(UINT64_MAX), rnd64.Uniform(UINT64_MAX),
-        rnd64.Uniform(UINT64_MAX), rnd.OneIn(2), id);
+        rnd.RandomString(rnd.Uniform(kStrMaxLen)) /* file_name */,
+        rnd64.Uniform(UINT64_MAX) /* smallest_seqno */,
+        rnd64.Uniform(UINT64_MAX) /* largest_seqno */,
+        rnd.RandomBinaryString(
+            rnd.Uniform(kStrMaxLen)) /* smallest_internal_key */,
+        rnd.RandomBinaryString(
+            rnd.Uniform(kStrMaxLen)) /* largest_internal_key */,
+        rnd64.Uniform(UINT64_MAX) /* oldest_ancester_time */,
+        rnd64.Uniform(UINT64_MAX) /* file_creation_time */,
+        rnd64.Uniform(UINT64_MAX) /* epoch_number */,
+        file_checksum /* file_checksum */,
+        file_checksum_func_name /* file_checksum_func_name */,
+        rnd64.Uniform(UINT64_MAX) /* paranoid_hash */,
+        rnd.OneIn(2) /* marked_for_compaction */, id /* unique_id */, tp);
   }
   result.output_level = rnd.Uniform(10);
   result.output_path = rnd.RandomString(rnd.Uniform(kStrMaxLen));
-  result.num_output_records = rnd64.Uniform(UINT64_MAX);
-  result.total_bytes = rnd64.Uniform(UINT64_MAX);
+  result.stats.num_output_records = rnd64.Uniform(UINT64_MAX);
   result.bytes_read = 123;
   result.bytes_written = rnd64.Uniform(UINT64_MAX);
   result.stats.elapsed_micros = rnd64.Uniform(UINT64_MAX);
@@ -1545,6 +1703,21 @@ TEST_F(CompactionJobTest, ResultSerialization) {
   ASSERT_OK(CompactionServiceResult::Read(output, &deserialized1));
   ASSERT_TRUE(deserialized1.TEST_Equals(&result));
 
+  for (size_t i = 0; i < result.output_files.size(); i++) {
+    for (const auto& prop :
+         result.output_files[i].table_properties.user_collected_properties) {
+      ASSERT_EQ(deserialized1.output_files[i]
+                    .table_properties.user_collected_properties[prop.first],
+                prop.second);
+    }
+    for (const auto& prop :
+         result.output_files[i].table_properties.readable_properties) {
+      ASSERT_EQ(deserialized1.output_files[i]
+                    .table_properties.readable_properties[prop.first],
+                prop.second);
+    }
+  }
+
   // Test mismatch
   deserialized1.stats.num_input_files += 10;
   std::string mismatch;
@@ -1559,6 +1732,10 @@ TEST_F(CompactionJobTest, ResultSerialization) {
     ASSERT_FALSE(deserialized_tmp.TEST_Equals(&result, &mismatch));
     ASSERT_EQ(mismatch, "output_files.unique_id");
     deserialized_tmp.status.PermitUncheckedError();
+
+    ASSERT_EQ(deserialized_tmp.output_files[0].file_checksum, file_checksum);
+    ASSERT_EQ(deserialized_tmp.output_files[0].file_checksum_func_name,
+              file_checksum_func_name);
   }
 
   // Test unknown field
@@ -1603,13 +1780,328 @@ TEST_F(CompactionJobTest, ResultSerialization) {
   }
 }
 
+TEST_F(CompactionJobTest, CutForMaxCompactionBytes) {
+  // dynamic_file_size option should have no impact on cutting for max
+  // compaction bytes.
+  NewDB();
+  mutable_cf_options_.target_file_size_base = 80;
+  mutable_cf_options_.max_compaction_bytes = 21;
+
+  auto file1 = mock::MakeMockFile({
+      {KeyStr("c", 5U, kTypeValue), "val2"},
+      {KeyStr("n", 6U, kTypeValue), "val3"},
+  });
+  AddMockFile(file1);
+
+  auto file2 = mock::MakeMockFile({{KeyStr("h", 3U, kTypeValue), "val"},
+                                   {KeyStr("j", 4U, kTypeValue), "val"}});
+  AddMockFile(file2, 1);
+
+  // Create three L2 files, each size 10.
+  // max_compaction_bytes 21 means the compaction output in L1 will
+  // be cut to at least two files.
+  auto file3 = mock::MakeMockFile({{KeyStr("b", 1U, kTypeValue), "val"},
+                                   {KeyStr("c", 1U, kTypeValue), "val"},
+                                   {KeyStr("c1", 1U, kTypeValue), "val"},
+                                   {KeyStr("c2", 1U, kTypeValue), "val"},
+                                   {KeyStr("c3", 1U, kTypeValue), "val"},
+                                   {KeyStr("c4", 1U, kTypeValue), "val"},
+                                   {KeyStr("d", 1U, kTypeValue), "val"},
+                                   {KeyStr("e", 2U, kTypeValue), "val"}});
+  AddMockFile(file3, 2);
+
+  auto file4 = mock::MakeMockFile({{KeyStr("h", 1U, kTypeValue), "val"},
+                                   {KeyStr("i", 1U, kTypeValue), "val"},
+                                   {KeyStr("i1", 1U, kTypeValue), "val"},
+                                   {KeyStr("i2", 1U, kTypeValue), "val"},
+                                   {KeyStr("i3", 1U, kTypeValue), "val"},
+                                   {KeyStr("i4", 1U, kTypeValue), "val"},
+                                   {KeyStr("j", 1U, kTypeValue), "val"},
+                                   {KeyStr("k", 2U, kTypeValue), "val"}});
+  AddMockFile(file4, 2);
+
+  auto file5 = mock::MakeMockFile({{KeyStr("l", 1U, kTypeValue), "val"},
+                                   {KeyStr("m", 1U, kTypeValue), "val"},
+                                   {KeyStr("m1", 1U, kTypeValue), "val"},
+                                   {KeyStr("m2", 1U, kTypeValue), "val"},
+                                   {KeyStr("m3", 1U, kTypeValue), "val"},
+                                   {KeyStr("m4", 1U, kTypeValue), "val"},
+                                   {KeyStr("n", 1U, kTypeValue), "val"},
+                                   {KeyStr("o", 2U, kTypeValue), "val"}});
+  AddMockFile(file5, 2);
+
+  // The expected output should be:
+  //  L1:   [c,   h,  j]        [n]
+  //  L2: [b ... e] [h ... k] [l ... o]
+  // It's better to have "j" in the first file, because anyway it's overlapping
+  // with the second file on L2.
+  // (Note: before this PR, it was cut at "h" because it's using the internal
+  // comparator which think L1 "h" with seqno 3 is smaller than L2 "h" with
+  // seqno 1, but actually they're overlapped with the compaction picker).
+
+  auto expected_file1 =
+      mock::MakeMockFile({{KeyStr("c", 5U, kTypeValue), "val2"},
+                          {KeyStr("h", 3U, kTypeValue), "val"},
+                          {KeyStr("j", 4U, kTypeValue), "val"}});
+  auto expected_file2 =
+      mock::MakeMockFile({{KeyStr("n", 6U, kTypeValue), "val3"}});
+
+  SetLastSequence(6U);
+
+  const std::vector<int> input_levels = {0, 1};
+  auto lvl0_files = cfd_->current()->storage_info()->LevelFiles(0);
+  auto lvl1_files = cfd_->current()->storage_info()->LevelFiles(1);
+
+  RunCompaction({lvl0_files, lvl1_files}, input_levels,
+                {expected_file1, expected_file2});
+}
+
+TEST_F(CompactionJobTest, CutToSkipGrandparentFile) {
+  NewDB();
+  // Make sure the grandparent level file size (10) qualifies skipping.
+  // Currently, it has to be > 1/8 of target file size.
+  mutable_cf_options_.target_file_size_base = 70;
+
+  auto file1 = mock::MakeMockFile({
+      {KeyStr("a", 5U, kTypeValue), "val2"},
+      {KeyStr("z", 6U, kTypeValue), "val3"},
+  });
+  AddMockFile(file1);
+
+  auto file2 = mock::MakeMockFile({{KeyStr("c", 3U, kTypeValue), "val"},
+                                   {KeyStr("x", 4U, kTypeValue), "val"}});
+  AddMockFile(file2, 1);
+
+  auto file3 = mock::MakeMockFile({{KeyStr("b", 1U, kTypeValue), "val"},
+                                   {KeyStr("d", 2U, kTypeValue), "val"}});
+  AddMockFile(file3, 2);
+
+  auto file4 = mock::MakeMockFile({{KeyStr("h", 1U, kTypeValue), "val"},
+                                   {KeyStr("i", 2U, kTypeValue), "val"}});
+  AddMockFile(file4, 2);
+
+  auto file5 = mock::MakeMockFile({{KeyStr("v", 1U, kTypeValue), "val"},
+                                   {KeyStr("y", 2U, kTypeValue), "val"}});
+  AddMockFile(file5, 2);
+
+  auto expected_file1 =
+      mock::MakeMockFile({{KeyStr("a", 5U, kTypeValue), "val2"},
+                          {KeyStr("c", 3U, kTypeValue), "val"}});
+  auto expected_file2 =
+      mock::MakeMockFile({{KeyStr("x", 4U, kTypeValue), "val"},
+                          {KeyStr("z", 6U, kTypeValue), "val3"}});
+
+  SetLastSequence(6U);
+  const std::vector<int> input_levels = {0, 1};
+  auto lvl0_files = cfd_->current()->storage_info()->LevelFiles(0);
+  auto lvl1_files = cfd_->current()->storage_info()->LevelFiles(1);
+  RunCompaction({lvl0_files, lvl1_files}, input_levels,
+                {expected_file1, expected_file2});
+}
+
+TEST_F(CompactionJobTest, CutToAlignGrandparentBoundary) {
+  NewDB();
+
+  // MockTable has 1 byte per entry by default and each file is 10 bytes.
+  // When the file size is smaller than 100, it won't cut file earlier to align
+  // with its grandparent boundary.
+  const size_t kKeyValueSize = 10000;
+  mock_table_factory_->SetKeyValueSize(kKeyValueSize);
+
+  mutable_cf_options_.target_file_size_base = 10 * kKeyValueSize;
+
+  mock::KVVector file1;
+  char ch = 'd';
+  // Add value from d -> o
+  for (char i = 0; i < 12; i++) {
+    file1.emplace_back(KeyStr(std::string(1, ch + i), i + 10, kTypeValue),
+                       "val" + std::to_string(i));
+  }
+
+  AddMockFile(file1);
+
+  auto file2 = mock::MakeMockFile({{KeyStr("e", 3U, kTypeValue), "val"},
+                                   {KeyStr("s", 4U, kTypeValue), "val"}});
+  AddMockFile(file2, 1);
+
+  // the 1st grandparent file should be skipped
+  auto file3 = mock::MakeMockFile({{KeyStr("a", 1U, kTypeValue), "val"},
+                                   {KeyStr("b", 2U, kTypeValue), "val"}});
+  AddMockFile(file3, 2);
+
+  auto file4 = mock::MakeMockFile({{KeyStr("c", 1U, kTypeValue), "val"},
+                                   {KeyStr("e", 2U, kTypeValue), "val"}});
+  AddMockFile(file4, 2);
+
+  auto file5 = mock::MakeMockFile({{KeyStr("h", 1U, kTypeValue), "val"},
+                                   {KeyStr("j", 2U, kTypeValue), "val"}});
+  AddMockFile(file5, 2);
+
+  auto file6 = mock::MakeMockFile({{KeyStr("k", 1U, kTypeValue), "val"},
+                                   {KeyStr("n", 2U, kTypeValue), "val"}});
+  AddMockFile(file6, 2);
+
+  auto file7 = mock::MakeMockFile({{KeyStr("q", 1U, kTypeValue), "val"},
+                                   {KeyStr("t", 2U, kTypeValue), "val"}});
+  AddMockFile(file7, 2);
+
+  // The expected outputs are:
+  //  L1:         [d,e,f,g,h,i,j] [k,l,m,n,o,s]
+  //  L2: [a, b] [c,  e]   [h, j] [k, n]  [q, t]
+  // The first output cut earlier at "j", so it could be aligned with L2 files.
+  // If dynamic_file_size is not enabled, it will be cut based on the
+  // target_file_size
+  mock::KVVector expected_file1;
+  for (char i = 0; i < 7; i++) {
+    expected_file1.emplace_back(
+        KeyStr(std::string(1, ch + i), i + 10, kTypeValue),
+        "val" + std::to_string(i));
+  }
+
+  mock::KVVector expected_file2;
+  for (char i = 7; i < 12; i++) {
+    expected_file2.emplace_back(
+        KeyStr(std::string(1, ch + i), i + 10, kTypeValue),
+        "val" + std::to_string(i));
+  }
+  expected_file2.emplace_back(KeyStr("s", 4U, kTypeValue), "val");
+
+  SetLastSequence(22U);
+  const std::vector<int> input_levels = {0, 1};
+  auto lvl0_files = cfd_->current()->storage_info()->LevelFiles(0);
+  auto lvl1_files = cfd_->current()->storage_info()->LevelFiles(1);
+  RunCompaction({lvl0_files, lvl1_files}, input_levels,
+                {expected_file1, expected_file2});
+}
+
+TEST_F(CompactionJobTest, CutToAlignGrandparentBoundarySameKey) {
+  NewDB();
+
+  // MockTable has 1 byte per entry by default and each file is 10 bytes.
+  // When the file size is smaller than 100, it won't cut file earlier to align
+  // with its grandparent boundary.
+  const size_t kKeyValueSize = 10000;
+  mock_table_factory_->SetKeyValueSize(kKeyValueSize);
+
+  mutable_cf_options_.target_file_size_base = 10 * kKeyValueSize;
+
+  mock::KVVector file1;
+  for (int i = 0; i < 7; i++) {
+    file1.emplace_back(KeyStr("a", 100 - i, kTypeValue),
+                       "val" + std::to_string(100 - i));
+  }
+  file1.emplace_back(KeyStr("b", 90, kTypeValue), "valb");
+
+  AddMockFile(file1);
+
+  auto file2 = mock::MakeMockFile({{KeyStr("a", 93U, kTypeValue), "val93"},
+                                   {KeyStr("b", 90U, kTypeValue), "valb"}});
+  AddMockFile(file2, 1);
+
+  auto file3 = mock::MakeMockFile({{KeyStr("a", 89U, kTypeValue), "val"},
+                                   {KeyStr("a", 88U, kTypeValue), "val"}});
+  AddMockFile(file3, 2);
+
+  auto file4 = mock::MakeMockFile({{KeyStr("a", 87U, kTypeValue), "val"},
+                                   {KeyStr("a", 86U, kTypeValue), "val"}});
+  AddMockFile(file4, 2);
+
+  auto file5 = mock::MakeMockFile({{KeyStr("b", 85U, kTypeValue), "val"},
+                                   {KeyStr("b", 84U, kTypeValue), "val"}});
+  AddMockFile(file5, 2);
+
+  mock::KVVector expected_file1;
+  for (int i = 0; i < 8; i++) {
+    expected_file1.emplace_back(KeyStr("a", 100 - i, kTypeValue),
+                                "val" + std::to_string(100 - i));
+  }
+
+  // make sure `b` is cut in a separated file (so internally it's not using
+  // internal comparator, which will think the "b:90" (seqno 90) here is smaller
+  // than "b:85" on L2.)
+  auto expected_file2 =
+      mock::MakeMockFile({{KeyStr("b", 90U, kTypeValue), "valb"}});
+
+  SetLastSequence(122U);
+  const std::vector<int> input_levels = {0, 1};
+  auto lvl0_files = cfd_->current()->storage_info()->LevelFiles(0);
+  auto lvl1_files = cfd_->current()->storage_info()->LevelFiles(1);
+
+  // Just keep all the history
+  std::vector<SequenceNumber> snapshots;
+  for (int i = 80; i <= 100; i++) {
+    snapshots.emplace_back(i);
+  }
+  RunCompaction({lvl0_files, lvl1_files}, input_levels,
+                {expected_file1, expected_file2}, snapshots);
+}
+
+TEST_F(CompactionJobTest, CutForMaxCompactionBytesSameKey) {
+  // dynamic_file_size option should have no impact on cutting for max
+  // compaction bytes.
+
+  NewDB();
+  mutable_cf_options_.target_file_size_base = 80;
+  mutable_cf_options_.max_compaction_bytes = 20;
+
+  auto file1 = mock::MakeMockFile({{KeyStr("a", 104U, kTypeValue), "val1"},
+                                   {KeyStr("b", 103U, kTypeValue), "val"}});
+  AddMockFile(file1);
+
+  auto file2 = mock::MakeMockFile({{KeyStr("a", 102U, kTypeValue), "val2"},
+                                   {KeyStr("c", 101U, kTypeValue), "val"}});
+  AddMockFile(file2, 1);
+
+  for (int i = 0; i < 10; i++) {
+    auto file =
+        mock::MakeMockFile({{KeyStr("a", 100 - (i * 2), kTypeValue), "val"},
+                            {KeyStr("a", 99 - (i * 2), kTypeValue), "val"}});
+    AddMockFile(file, 2);
+  }
+
+  for (int i = 0; i < 10; i++) {
+    auto file =
+        mock::MakeMockFile({{KeyStr("b", 80 - (i * 2), kTypeValue), "val"},
+                            {KeyStr("b", 79 - (i * 2), kTypeValue), "val"}});
+    AddMockFile(file, 2);
+  }
+
+  auto file5 = mock::MakeMockFile({{KeyStr("c", 60U, kTypeValue), "valc"},
+                                   {KeyStr("c", 59U, kTypeValue), "valc"}});
+
+  // "a" has 10 overlapped grandparent files (each size 10), which is far
+  // exceeded the `max_compaction_bytes`, but make sure 2 "a" are not separated,
+  // as splitting them won't help reducing the compaction size.
+  // also make sure "b" and "c" are cut separately.
+  mock::KVVector expected_file1 =
+      mock::MakeMockFile({{KeyStr("a", 104U, kTypeValue), "val1"},
+                          {KeyStr("a", 102U, kTypeValue), "val2"}});
+  mock::KVVector expected_file2 =
+      mock::MakeMockFile({{KeyStr("b", 103U, kTypeValue), "val"}});
+  mock::KVVector expected_file3 =
+      mock::MakeMockFile({{KeyStr("c", 101U, kTypeValue), "val"}});
+
+  SetLastSequence(122U);
+  const std::vector<int> input_levels = {0, 1};
+  auto lvl0_files = cfd_->current()->storage_info()->LevelFiles(0);
+  auto lvl1_files = cfd_->current()->storage_info()->LevelFiles(1);
+
+  // Just keep all the history
+  std::vector<SequenceNumber> snapshots;
+  for (int i = 80; i <= 105; i++) {
+    snapshots.emplace_back(i);
+  }
+  RunCompaction({lvl0_files, lvl1_files}, input_levels,
+                {expected_file1, expected_file2, expected_file3}, snapshots);
+}
 
 class CompactionJobTimestampTest : public CompactionJobTestBase {
  public:
   CompactionJobTimestampTest()
       : CompactionJobTestBase(test::PerThreadDBPath("compaction_job_ts_test"),
                               test::BytewiseComparatorWithU64TsWrapper(),
-                              test::EncodeInt, false) {}
+                              test::EncodeInt, /*test_io_priority=*/false,
+                              TableTypeForTest::kMockTable) {}
 };
 
 TEST_F(CompactionJobTimestampTest, GCDisabled) {
@@ -1641,8 +2133,9 @@ TEST_F(CompactionJobTimestampTest, GCDisabled) {
        {KeyStr("c", 4, ValueType::kTypeValue, 94), "c5"},
        {KeyStr("d", 7, ValueType::kTypeValue, 97), "d7"},
        {KeyStr("d", 3, ValueType::kTypeSingleDeletion, 93), ""}});
-  const auto& files = cfd_->current()->storage_info()->LevelFiles(0);
-  RunCompaction({files}, expected_results);
+  constexpr int input_level = 0;
+  const auto& files = cfd_->current()->storage_info()->LevelFiles(input_level);
+  RunCompaction({files}, {input_level}, {expected_results});
 }
 
 TEST_F(CompactionJobTimestampTest, NoKeyExpired) {
@@ -1667,10 +2160,11 @@ TEST_F(CompactionJobTimestampTest, NoKeyExpired) {
                           {KeyStr("b", 7, ValueType::kTypeValue, 101), "b7"},
                           {KeyStr("c", 5, ValueType::kTypeValue, 99), "c5"},
                           {KeyStr("c", 3, ValueType::kTypeValue, 97), "c3"}});
-  const auto& files = cfd_->current()->storage_info()->LevelFiles(0);
+  constexpr int input_level = 0;
+  const auto& files = cfd_->current()->storage_info()->LevelFiles(input_level);
 
   full_history_ts_low_ = encode_u64_ts_(0);
-  RunCompaction({files}, expected_results);
+  RunCompaction({files}, {input_level}, {expected_results});
 }
 
 TEST_F(CompactionJobTimestampTest, AllKeysExpired) {
@@ -1693,10 +2187,11 @@ TEST_F(CompactionJobTimestampTest, AllKeysExpired) {
 
   auto expected_results =
       mock::MakeMockFile({{KeyStr("c", 0, ValueType::kTypeValue, 0), "c7"}});
-  const auto& files = cfd_->current()->storage_info()->LevelFiles(0);
+  constexpr int input_level = 0;
+  const auto& files = cfd_->current()->storage_info()->LevelFiles(input_level);
 
   full_history_ts_low_ = encode_u64_ts_(std::numeric_limits<uint64_t>::max());
-  RunCompaction({files}, expected_results);
+  RunCompaction({files}, {input_level}, {expected_results});
 }
 
 TEST_F(CompactionJobTimestampTest, SomeKeysExpired) {
@@ -1719,10 +2214,121 @@ TEST_F(CompactionJobTimestampTest, SomeKeysExpired) {
       mock::MakeMockFile({{KeyStr("a", 5, ValueType::kTypeValue, 50), "a5"},
                           {KeyStr("a", 0, ValueType::kTypeValue, 0), "a3"},
                           {KeyStr("b", 6, ValueType::kTypeValue, 49), "b6"}});
-  const auto& files = cfd_->current()->storage_info()->LevelFiles(0);
+  constexpr int input_level = 0;
+  const auto& files = cfd_->current()->storage_info()->LevelFiles(input_level);
 
   full_history_ts_low_ = encode_u64_ts_(49);
-  RunCompaction({files}, expected_results);
+  RunCompaction({files}, {input_level}, {expected_results});
+}
+
+class CompactionJobTimestampTestWithBbTable : public CompactionJobTestBase {
+ public:
+  // Block-based table is needed if we want to test subcompaction partitioning
+  // with anchors.
+  explicit CompactionJobTimestampTestWithBbTable()
+      : CompactionJobTestBase(
+            test::PerThreadDBPath("compaction_job_ts_bbt_test"),
+            test::BytewiseComparatorWithU64TsWrapper(), test::EncodeInt,
+            /*test_io_priority=*/false, TableTypeForTest::kBlockBasedTable) {}
+};
+
+TEST_F(CompactionJobTimestampTestWithBbTable, SubcompactionAnchorL1) {
+  cf_options_.target_file_size_base = 20;
+  mutable_cf_options_.target_file_size_base = 20;
+  NewDB();
+
+  const std::vector<std::string> keys = {
+      KeyStr("a", 20, ValueType::kTypeValue, 200),
+      KeyStr("b", 21, ValueType::kTypeValue, 210),
+      KeyStr("b", 20, ValueType::kTypeValue, 200),
+      KeyStr("b", 18, ValueType::kTypeValue, 180),
+      KeyStr("c", 17, ValueType::kTypeValue, 170),
+      KeyStr("c", 16, ValueType::kTypeValue, 160),
+      KeyStr("c", 15, ValueType::kTypeValue, 150)};
+  const std::vector<std::string> values = {"a20", "b21", "b20", "b18",
+                                           "c17", "c16", "c15"};
+
+  constexpr int input_level = 1;
+
+  auto file1 = mock::MakeMockFile(
+      {{keys[0], values[0]}, {keys[1], values[1]}, {keys[2], values[2]}});
+  AddMockFile(file1, input_level);
+
+  auto file2 = mock::MakeMockFile(
+      {{keys[3], values[3]}, {keys[4], values[4]}, {keys[5], values[5]}});
+  AddMockFile(file2, input_level);
+
+  auto file3 = mock::MakeMockFile({{keys[6], values[6]}});
+  AddMockFile(file3, input_level);
+
+  SetLastSequence(20);
+
+  auto output1 = mock::MakeMockFile({{keys[0], values[0]}});
+  auto output2 = mock::MakeMockFile(
+      {{keys[1], values[1]}, {keys[2], values[2]}, {keys[3], values[3]}});
+  auto output3 = mock::MakeMockFile(
+      {{keys[4], values[4]}, {keys[5], values[5]}, {keys[6], values[6]}});
+
+  auto expected_results =
+      std::vector<mock::KVVector>{output1, output2, output3};
+  const auto& files = cfd_->current()->storage_info()->LevelFiles(input_level);
+
+  constexpr int output_level = 2;
+  constexpr int max_subcompactions = 4;
+  RunCompaction({files}, {input_level}, expected_results, /*snapshots=*/{},
+                /*earliest_write_conflict_snapshot=*/kMaxSequenceNumber,
+                output_level, /*verify=*/true, {kInvalidBlobFileNumber},
+                /*check_get_priority=*/false, Env::IO_TOTAL, Env::IO_TOTAL,
+                max_subcompactions);
+}
+
+TEST_F(CompactionJobTimestampTestWithBbTable, SubcompactionL0) {
+  cf_options_.target_file_size_base = 20;
+  mutable_cf_options_.target_file_size_base = 20;
+  NewDB();
+
+  const std::vector<std::string> keys = {
+      KeyStr("a", 20, ValueType::kTypeValue, 200),
+      KeyStr("b", 20, ValueType::kTypeValue, 200),
+      KeyStr("b", 19, ValueType::kTypeValue, 190),
+      KeyStr("b", 18, ValueType::kTypeValue, 180),
+      KeyStr("c", 17, ValueType::kTypeValue, 170),
+      KeyStr("c", 16, ValueType::kTypeValue, 160),
+      KeyStr("c", 15, ValueType::kTypeValue, 150)};
+  const std::vector<std::string> values = {"a20", "b20", "b19", "b18",
+                                           "c17", "c16", "c15"};
+
+  constexpr int input_level = 0;
+
+  auto file1 = mock::MakeMockFile({{keys[5], values[5]}, {keys[6], values[6]}});
+  AddMockFile(file1, input_level);
+
+  auto file2 = mock::MakeMockFile({{keys[3], values[3]}, {keys[4], values[4]}});
+  AddMockFile(file2, input_level);
+
+  auto file3 = mock::MakeMockFile(
+      {{keys[0], values[0]}, {keys[1], values[1]}, {keys[2], values[2]}});
+  AddMockFile(file3, input_level);
+
+  SetLastSequence(20);
+
+  auto output1 = mock::MakeMockFile({{keys[0], values[0]}});
+  auto output2 = mock::MakeMockFile(
+      {{keys[1], values[1]}, {keys[2], values[2]}, {keys[3], values[3]}});
+  auto output3 = mock::MakeMockFile(
+      {{keys[4], values[4]}, {keys[5], values[5]}, {keys[6], values[6]}});
+
+  auto expected_results =
+      std::vector<mock::KVVector>{output1, output2, output3};
+  const auto& files = cfd_->current()->storage_info()->LevelFiles(input_level);
+
+  constexpr int output_level = 1;
+  constexpr int max_subcompactions = 4;
+  RunCompaction({files}, {input_level}, expected_results, /*snapshots=*/{},
+                /*earliest_write_conflict_snapshot=*/kMaxSequenceNumber,
+                output_level, /*verify=*/true, {kInvalidBlobFileNumber},
+                /*check_get_priority=*/false, Env::IO_TOTAL, Env::IO_TOTAL,
+                max_subcompactions);
 }
 
 // The io priority of the compaction reads and writes are different from
@@ -1734,7 +2340,8 @@ class CompactionJobIOPriorityTest : public CompactionJobTestBase {
   CompactionJobIOPriorityTest()
       : CompactionJobTestBase(
             test::PerThreadDBPath("compaction_job_io_priority_test"),
-            BytewiseComparator(), [](uint64_t /*ts*/) { return ""; }, true) {}
+            BytewiseComparator(), [](uint64_t /*ts*/) { return ""; },
+            /*test_io_priority=*/true, TableTypeForTest::kBlockBasedTable) {}
 };
 
 TEST_F(CompactionJobIOPriorityTest, WriteControllerStateNormal) {
@@ -1742,10 +2349,12 @@ TEST_F(CompactionJobIOPriorityTest, WriteControllerStateNormal) {
   NewDB();
   mock::KVVector expected_results = CreateTwoFiles(false);
   auto cfd = versions_->GetColumnFamilySet()->GetDefault();
-  auto files = cfd->current()->storage_info()->LevelFiles(0);
+  constexpr int input_level = 0;
+  auto files = cfd->current()->storage_info()->LevelFiles(input_level);
   ASSERT_EQ(2U, files.size());
-  RunCompaction({files}, expected_results, {}, kMaxSequenceNumber, 1, false,
-                kInvalidBlobFileNumber, false, Env::IO_LOW, Env::IO_LOW);
+  RunCompaction({files}, {input_level}, {expected_results}, {},
+                kMaxSequenceNumber, 1, false, {kInvalidBlobFileNumber}, false,
+                Env::IO_LOW, Env::IO_LOW);
 }
 
 TEST_F(CompactionJobIOPriorityTest, WriteControllerStateDelayed) {
@@ -1753,13 +2362,15 @@ TEST_F(CompactionJobIOPriorityTest, WriteControllerStateDelayed) {
   NewDB();
   mock::KVVector expected_results = CreateTwoFiles(false);
   auto cfd = versions_->GetColumnFamilySet()->GetDefault();
-  auto files = cfd->current()->storage_info()->LevelFiles(0);
+  constexpr int input_level = 0;
+  auto files = cfd->current()->storage_info()->LevelFiles(input_level);
   ASSERT_EQ(2U, files.size());
   {
     std::unique_ptr<WriteControllerToken> delay_token =
         write_controller_.GetDelayToken(1000000);
-    RunCompaction({files}, expected_results, {}, kMaxSequenceNumber, 1, false,
-                  kInvalidBlobFileNumber, false, Env::IO_USER, Env::IO_USER);
+    RunCompaction({files}, {input_level}, {expected_results}, {},
+                  kMaxSequenceNumber, 1, false, {kInvalidBlobFileNumber}, false,
+                  Env::IO_USER, Env::IO_USER);
   }
 }
 
@@ -1768,13 +2379,15 @@ TEST_F(CompactionJobIOPriorityTest, WriteControllerStateStalled) {
   NewDB();
   mock::KVVector expected_results = CreateTwoFiles(false);
   auto cfd = versions_->GetColumnFamilySet()->GetDefault();
-  auto files = cfd->current()->storage_info()->LevelFiles(0);
+  constexpr int input_level = 0;
+  auto files = cfd->current()->storage_info()->LevelFiles(input_level);
   ASSERT_EQ(2U, files.size());
   {
     std::unique_ptr<WriteControllerToken> stop_token =
         write_controller_.GetStopToken();
-    RunCompaction({files}, expected_results, {}, kMaxSequenceNumber, 1, false,
-                  kInvalidBlobFileNumber, false, Env::IO_USER, Env::IO_USER);
+    RunCompaction({files}, {input_level}, {expected_results}, {},
+                  kMaxSequenceNumber, 1, false, {kInvalidBlobFileNumber}, false,
+                  Env::IO_USER, Env::IO_USER);
   }
 }
 
@@ -1782,27 +2395,19 @@ TEST_F(CompactionJobIOPriorityTest, GetRateLimiterPriority) {
   NewDB();
   mock::KVVector expected_results = CreateTwoFiles(false);
   auto cfd = versions_->GetColumnFamilySet()->GetDefault();
-  auto files = cfd->current()->storage_info()->LevelFiles(0);
+  constexpr int input_level = 0;
+  auto files = cfd->current()->storage_info()->LevelFiles(input_level);
   ASSERT_EQ(2U, files.size());
-  RunCompaction({files}, expected_results, {}, kMaxSequenceNumber, 1, false,
-                kInvalidBlobFileNumber, true, Env::IO_LOW, Env::IO_LOW);
+  RunCompaction({files}, {input_level}, {expected_results}, {},
+                kMaxSequenceNumber, 1, false, {kInvalidBlobFileNumber}, true,
+                Env::IO_LOW, Env::IO_LOW);
 }
 
 }  // namespace ROCKSDB_NAMESPACE
 
 int main(int argc, char** argv) {
+  ROCKSDB_NAMESPACE::port::InstallStackTraceHandler();
   ::testing::InitGoogleTest(&argc, argv);
   RegisterCustomObjects(argc, argv);
   return RUN_ALL_TESTS();
 }
-
-#else
-#include <stdio.h>
-
-int main(int /*argc*/, char** /*argv*/) {
-  fprintf(stderr,
-          "SKIPPED as CompactionJobStats is not supported in ROCKSDB_LITE\n");
-  return 0;
-}
-
-#endif  // ROCKSDB_LITE

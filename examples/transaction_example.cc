@@ -3,8 +3,6 @@
 //  COPYING file in the root directory) and Apache 2.0 License
 //  (found in the LICENSE.Apache file in the root directory).
 
-#ifndef ROCKSDB_LITE
-
 #include "rocksdb/db.h"
 #include "rocksdb/options.h"
 #include "rocksdb/slice.h"
@@ -194,5 +192,3 @@ int main() {
   ROCKSDB_NAMESPACE::DestroyDB(kDBPath, options);
   return 0;
 }
-
-#endif  // ROCKSDB_LITE

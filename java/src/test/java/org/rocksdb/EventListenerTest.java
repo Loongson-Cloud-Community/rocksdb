@@ -13,12 +13,14 @@ import java.util.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 import org.assertj.core.api.AbstractObjectAssert;
 import org.assertj.core.api.ObjectAssert;
+import org.junit.Assume;
 import org.junit.ClassRule;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
 import org.rocksdb.AbstractEventListener.EnabledEventCallback;
 import org.rocksdb.test.TestableEventListener;
+import org.rocksdb.util.Environment;
 
 public class EventListenerTest {
   @ClassRule
@@ -73,20 +75,49 @@ public class EventListenerTest {
 
   void deleteTableFile(final AbstractEventListener el, final AtomicBoolean wasCbCalled)
       throws RocksDBException {
-    try (final Options opt =
-             new Options().setCreateIfMissing(true).setListeners(Collections.singletonList(el));
+    final int KEY_SIZE = 20;
+    final int VALUE_SIZE = 1000;
+    final int FILE_SIZE = 64000;
+    final int NUM_FILES = 2;
+
+    final int KEY_INTERVAL = 10000;
+    /*
+     * Intention of these options is to end up reliably with NUM_FILES files.
+     * we will be deleting using deleteFilesInRange.
+     * It is writing roughly number of keys that will fit in NUM_FILES files (target size).
+     * It is writing interleaved so that files from memory on L0 will overlap.
+     * Then compaction cleans everything, and we should end up with NUM_FILES files.
+     */
+    try (final Options opt = new Options()
+                                 .setCreateIfMissing(true)
+                                 .setListeners(Collections.singletonList(el))
+                                 .setCompressionType(CompressionType.NO_COMPRESSION)
+                                 .setTargetFileSizeBase(FILE_SIZE)
+                                 .setWriteBufferSize(FILE_SIZE / 2)
+                                 .setDisableAutoCompactions(true)
+                                 .setLevelCompactionDynamicLevelBytes(false);
          final RocksDB db = RocksDB.open(opt, dbFolder.getRoot().getAbsolutePath())) {
-      assertThat(db).isNotNull();
-      final byte[] value = new byte[24];
-      rand.nextBytes(value);
-      db.put("testKey".getBytes(), value);
-      final RocksDB.LiveFiles liveFiles = db.getLiveFiles();
-      assertThat(liveFiles).isNotNull();
-      assertThat(liveFiles.files).isNotNull();
-      assertThat(liveFiles.files.isEmpty()).isFalse();
-      db.deleteFile(liveFiles.files.get(0));
-      assertThat(wasCbCalled.get()).isTrue();
+      final int records = FILE_SIZE / (KEY_SIZE + VALUE_SIZE);
+
+      // fill database with key/value pairs
+      final byte[] value = new byte[VALUE_SIZE];
+      int key_init = 0;
+      for (int o = 0; o < NUM_FILES; ++o) {
+        int int_key = key_init++;
+        for (int i = 0; i < records; ++i) {
+          int_key += KEY_INTERVAL;
+          rand.nextBytes(value);
+
+          db.put(String.format("%020d", int_key).getBytes(), value);
+        }
+      }
+      try (final FlushOptions flushOptions = new FlushOptions().setWaitForFlush(true)) {
+        db.flush(flushOptions);
+      }
+      db.compactRange();
+      db.deleteFilesInRanges(null, Arrays.asList(null, null), false /* includeEnd */);
     }
+    assertThat(wasCbCalled.get()).isTrue();
   }
 
   @Test
@@ -181,7 +212,7 @@ public class EventListenerTest {
       final byte[] value = new byte[24];
       rand.nextBytes(value);
       db.put("testKey".getBytes(), value);
-      ColumnFamilyHandle columnFamilyHandle = db.getDefaultColumnFamily();
+      final ColumnFamilyHandle columnFamilyHandle = db.getDefaultColumnFamily();
       columnFamilyHandle.close();
       assertThat(wasCbCalled.get()).isTrue();
     }
@@ -264,9 +295,9 @@ public class EventListenerTest {
     final MemTableInfo memTableInfoTestData = new MemTableInfo(
         "columnFamilyName", TEST_LONG_VAL, TEST_LONG_VAL, TEST_LONG_VAL, TEST_LONG_VAL);
     final FileOperationInfo fileOperationInfoTestData = new FileOperationInfo("/file/path",
-        TEST_LONG_VAL, TEST_LONG_VAL, 1_600_699_420_000_000_000L, 5_000_000_000L, statusTestData);
+        TEST_LONG_VAL, 4096, 1_600_699_420_000_000_000L, 5_000_000_000L, statusTestData);
     final WriteStallInfo writeStallInfoTestData =
-        new WriteStallInfo("columnFamilyName", (byte) 0x1, (byte) 0x2);
+        new WriteStallInfo("columnFamilyName", (byte) 0x0, (byte) 0x1);
     final ExternalFileIngestionInfo externalFileIngestionInfoTestData =
         new ExternalFileIngestionInfo("columnFamilyName", "/external/file/path",
             "/internal/file/path", TEST_LONG_VAL, tablePropertiesTestData);
@@ -475,7 +506,7 @@ public class EventListenerTest {
 
   private static void assertNoCallbackErrors(
       final CapturingTestableEventListener capturingTestableEventListener) {
-    for (AssertionError error : capturingTestableEventListener.capturedAssertionErrors) {
+    for (final AssertionError error : capturingTestableEventListener.capturedAssertionErrors) {
       throw new Error("An assertion failed in callback", error);
     }
   }
@@ -565,16 +596,16 @@ public class EventListenerTest {
 
   private static class CapturingObjectAssert<T> extends ObjectAssert<T> {
     private final List<AssertionError> assertionErrors;
-    public CapturingObjectAssert(T t, List<AssertionError> assertionErrors) {
+    public CapturingObjectAssert(final T t, final List<AssertionError> assertionErrors) {
       super(t);
       this.assertionErrors = assertionErrors;
     }
 
     @Override
-    public ObjectAssert<T> isEqualTo(Object other) {
+    public ObjectAssert<T> isEqualTo(final Object other) {
       try {
         return super.isEqualTo(other);
-      } catch (AssertionError error) {
+      } catch (final AssertionError error) {
         assertionErrors.add(error);
         throw error;
       }
@@ -584,7 +615,7 @@ public class EventListenerTest {
     public ObjectAssert<T> isNotNull() {
       try {
         return super.isNotNull();
-      } catch (AssertionError error) {
+      } catch (final AssertionError error) {
         assertionErrors.add(error);
         throw error;
       }
@@ -596,8 +627,8 @@ public class EventListenerTest {
 
     final List<AssertionError> capturedAssertionErrors = new ArrayList<>();
 
-    protected <T> AbstractObjectAssert<?, T> assertThat(T actual) {
-      return new CapturingObjectAssert<T>(actual, capturedAssertionErrors);
+    protected <T> AbstractObjectAssert<?, T> assertThat(final T actual) {
+      return new CapturingObjectAssert<>(actual, capturedAssertionErrors);
     }
 
     public CapturingTestableEventListener() {}

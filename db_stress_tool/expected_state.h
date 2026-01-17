@@ -13,6 +13,7 @@
 #include <memory>
 
 #include "db/dbformat.h"
+#include "db_stress_tool/expected_value.h"
 #include "file/file_util.h"
 #include "rocksdb/db.h"
 #include "rocksdb/env.h"
@@ -22,9 +23,8 @@
 #include "util/string_util.h"
 
 namespace ROCKSDB_NAMESPACE {
-
-// An `ExpectedState` provides read/write access to expected values for every
-// key.
+// `ExpectedState` provides read/write access to expected values stored in
+// `ExpectedState` for every key.
 class ExpectedState {
  public:
   explicit ExpectedState(size_t max_key, size_t num_column_families);
@@ -38,41 +38,88 @@ class ExpectedState {
   // Requires external locking covering all keys in `cf`.
   void ClearColumnFamily(int cf);
 
-  // @param pending True if the update may have started but is not yet
-  //    guaranteed finished. This is useful for crash-recovery testing when the
-  //    process may crash before updating the expected values array.
+  // Requires external locking
+  void SetPersistedSeqno(SequenceNumber seqno) {
+    persisted_seqno_->store(
+        std::max(persisted_seqno_->load(std::memory_order_relaxed), seqno),
+        std::memory_order_relaxed);
+  }
+
+  // Requires external locking
+  SequenceNumber GetPersistedSeqno() {
+    return persisted_seqno_->load(std::memory_order_relaxed);
+  }
+
+  // Prepare a Put that will be started but not finished yet
+  // This is useful for crash-recovery testing when the process may crash
+  // before updating the corresponding expected value
   //
-  // Requires external locking covering `key` in `cf`.
-  void Put(int cf, int64_t key, uint32_t value_base, bool pending);
+  // Requires external locking covering `key` in `cf` to prevent concurrent
+  // write or delete to the same `key`.
+  PendingExpectedValue PreparePut(int cf, int64_t key);
 
-  // Requires external locking covering `key` in `cf`.
-  uint32_t Get(int cf, int64_t key) const;
+  // Does not requires external locking.
+  ExpectedValue Get(int cf, int64_t key);
 
-  // @param pending See comment above Put()
-  // Returns true if the key was not yet deleted.
+  // Prepare a Delete that will be started but not finished yet.
+  // This is useful for crash-recovery testing when the process may crash
+  // before updating the corresponding expected value
   //
-  // Requires external locking covering `key` in `cf`.
-  bool Delete(int cf, int64_t key, bool pending);
+  // Requires external locking covering `key` in `cf` to prevent concurrent
+  // write or delete to the same `key`.
+  PendingExpectedValue PrepareDelete(int cf, int64_t key);
 
-  // @param pending See comment above Put()
-  // Returns true if the key was not yet deleted.
-  //
-  // Requires external locking covering `key` in `cf`.
-  bool SingleDelete(int cf, int64_t key, bool pending);
+  // Requires external locking covering `key` in `cf` to prevent concurrent
+  // write or delete to the same `key`.
+  PendingExpectedValue PrepareSingleDelete(int cf, int64_t key);
 
-  // @param pending See comment above Put()
-  // Returns number of keys deleted by the call.
-  //
-  // Requires external locking covering keys in `[begin_key, end_key)` in `cf`.
-  int DeleteRange(int cf, int64_t begin_key, int64_t end_key, bool pending);
+  // Requires external locking covering keys in `[begin_key, end_key)` in `cf`
+  // to prevent concurrent write or delete to the same `key`.
+  std::vector<PendingExpectedValue> PrepareDeleteRange(int cf,
+                                                       int64_t begin_key,
+                                                       int64_t end_key);
 
-  // Requires external locking covering `key` in `cf`.
+  // Update the expected value for start of an incomplete write or delete
+  // operation on the key assoicated with this expected value
+  void Precommit(int cf, int64_t key, const ExpectedValue& value);
+
+  // Requires external locking covering `key` in `cf` to prevent concurrent
+  // delete to the same `key`.
   bool Exists(int cf, int64_t key);
 
+  // Sync the `value_base` to the corresponding expected value
+  //
+  // Requires external locking covering `key` in `cf` or be in single thread
+  // to prevent concurrent write or delete to the same `key`
+  void SyncPut(int cf, int64_t key, uint32_t value_base);
+
+  // Sync the corresponding expected value to be pending Put
+  //
+  // Requires external locking covering `key` in `cf` or be in single thread
+  // to prevent concurrent write or delete to the same `key`
+  void SyncPendingPut(int cf, int64_t key);
+
+  // Sync the corresponding expected value to be deleted
+  //
+  // Requires external locking covering `key` in `cf` or be in single thread
+  // to prevent concurrent write or delete to the same `key`
+  void SyncDelete(int cf, int64_t key);
+
+  // Sync the corresponding expected values to be deleted
+  //
+  // Requires external locking covering keys in `[begin_key, end_key)` in `cf`
+  // to prevent concurrent write or delete to the same `key`
+  void SyncDeleteRange(int cf, int64_t begin_key, int64_t end_key);
+
  private:
-  // Requires external locking covering `key` in `cf`.
+  // Does not requires external locking.
   std::atomic<uint32_t>& Value(int cf, int64_t key) const {
     return values_[cf * max_key_ + key];
+  }
+
+  // Does not requires external locking
+  ExpectedValue Load(int cf, int64_t key) const {
+    return ExpectedValue(Value(cf, key).load());
   }
 
   const size_t max_key_;
@@ -88,21 +135,50 @@ class ExpectedState {
   void Reset();
 
   std::atomic<uint32_t>* values_;
+  std::atomic<SequenceNumber>* persisted_seqno_;
 };
 
 // A `FileExpectedState` implements `ExpectedState` backed by a file.
 class FileExpectedState : public ExpectedState {
  public:
-  explicit FileExpectedState(std::string expected_state_file_path,
-                             size_t max_key, size_t num_column_families);
+  explicit FileExpectedState(
+      const std::string& expected_state_file_path,
+      const std::string& expected_persisted_seqno_file_path, size_t max_key,
+      size_t num_column_families);
 
   // Requires external locking preventing concurrent execution with any other
   // member function.
   Status Open(bool create) override;
 
  private:
+  static Status CreateFile(Env* env, const EnvOptions& options,
+                           const std::string& file_path,
+                           const std::string& content) {
+    std::unique_ptr<WritableFile> wfile;
+    Status status = env->NewWritableFile(file_path, &wfile, options);
+    if (status.ok()) {
+      status = wfile->Append(content);
+    }
+    return status;
+  }
+
+  static Status MemoryMappedFile(
+      Env* env, const std::string& file_path,
+      std::unique_ptr<MemoryMappedFileBuffer>& memory_mapped_file_buffer,
+      std::size_t size) {
+    Status status =
+        env->NewMemoryMappedFileBuffer(file_path, &memory_mapped_file_buffer);
+    if (status.ok()) {
+      assert(memory_mapped_file_buffer->GetLen() == size);
+    }
+    (void)size;
+    return status;
+  }
+
   const std::string expected_state_file_path_;
+  const std::string expected_persisted_seqno_file_path_;
   std::unique_ptr<MemoryMappedFileBuffer> expected_state_mmap_buffer_;
+  std::unique_ptr<MemoryMappedFileBuffer> expected_persisted_seqno_mmap_buffer_;
 };
 
 // An `AnonExpectedState` implements `ExpectedState` backed by a memory
@@ -160,44 +236,57 @@ class ExpectedStateManager {
   // Requires external locking covering all keys in `cf`.
   void ClearColumnFamily(int cf) { return latest_->ClearColumnFamily(cf); }
 
-  // @param pending True if the update may have started but is not yet
-  //    guaranteed finished. This is useful for crash-recovery testing when the
-  //    process may crash before updating the expected values array.
-  //
-  // Requires external locking covering `key` in `cf`.
-  void Put(int cf, int64_t key, uint32_t value_base, bool pending) {
-    return latest_->Put(cf, key, value_base, pending);
+  void SetPersistedSeqno(SequenceNumber seqno) {
+    return latest_->SetPersistedSeqno(seqno);
   }
 
-  // Requires external locking covering `key` in `cf`.
-  uint32_t Get(int cf, int64_t key) const { return latest_->Get(cf, key); }
+  SequenceNumber GetPersistedSeqno() { return latest_->GetPersistedSeqno(); }
 
-  // @param pending See comment above Put()
-  // Returns true if the key was not yet deleted.
-  //
-  // Requires external locking covering `key` in `cf`.
-  bool Delete(int cf, int64_t key, bool pending) {
-    return latest_->Delete(cf, key, pending);
+  // See ExpectedState::PreparePut()
+  PendingExpectedValue PreparePut(int cf, int64_t key) {
+    return latest_->PreparePut(cf, key);
   }
 
-  // @param pending See comment above Put()
-  // Returns true if the key was not yet deleted.
-  //
-  // Requires external locking covering `key` in `cf`.
-  bool SingleDelete(int cf, int64_t key, bool pending) {
-    return latest_->SingleDelete(cf, key, pending);
+  // See ExpectedState::Get()
+  ExpectedValue Get(int cf, int64_t key) { return latest_->Get(cf, key); }
+
+  // See ExpectedState::PrepareDelete()
+  PendingExpectedValue PrepareDelete(int cf, int64_t key) {
+    return latest_->PrepareDelete(cf, key);
   }
 
-  // @param pending See comment above Put()
-  // Returns number of keys deleted by the call.
-  //
-  // Requires external locking covering keys in `[begin_key, end_key)` in `cf`.
-  int DeleteRange(int cf, int64_t begin_key, int64_t end_key, bool pending) {
-    return latest_->DeleteRange(cf, begin_key, end_key, pending);
+  // See ExpectedState::PrepareSingleDelete()
+  PendingExpectedValue PrepareSingleDelete(int cf, int64_t key) {
+    return latest_->PrepareSingleDelete(cf, key);
   }
 
-  // Requires external locking covering `key` in `cf`.
+  // See ExpectedState::PrepareDeleteRange()
+  std::vector<PendingExpectedValue> PrepareDeleteRange(int cf,
+                                                       int64_t begin_key,
+                                                       int64_t end_key) {
+    return latest_->PrepareDeleteRange(cf, begin_key, end_key);
+  }
+
+  // See ExpectedState::Exists()
   bool Exists(int cf, int64_t key) { return latest_->Exists(cf, key); }
+
+  // See ExpectedState::SyncPut()
+  void SyncPut(int cf, int64_t key, uint32_t value_base) {
+    return latest_->SyncPut(cf, key, value_base);
+  }
+
+  // See ExpectedState::SyncPendingPut()
+  void SyncPendingPut(int cf, int64_t key) {
+    return latest_->SyncPendingPut(cf, key);
+  }
+
+  // See ExpectedState::SyncDelete()
+  void SyncDelete(int cf, int64_t key) { return latest_->SyncDelete(cf, key); }
+
+  // See ExpectedState::SyncDeleteRange()
+  void SyncDeleteRange(int cf, int64_t begin_key, int64_t end_key) {
+    return latest_->SyncDeleteRange(cf, begin_key, end_key);
+  }
 
  protected:
   const size_t max_key_;
@@ -247,6 +336,8 @@ class FileExpectedStateManager : public ExpectedStateManager {
   static const std::string kLatestBasename;
   static const std::string kStateFilenameSuffix;
   static const std::string kTraceFilenameSuffix;
+  static const std::string kPersistedSeqnoBasename;
+  static const std::string kPersistedSeqnoFilenameSuffix;
   static const std::string kTempFilenamePrefix;
   static const std::string kTempFilenameSuffix;
 
@@ -281,7 +372,6 @@ class AnonExpectedStateManager : public ExpectedStateManager {
   // member function.
   Status Open() override;
 };
-
 }  // namespace ROCKSDB_NAMESPACE
 
 #endif  // GFLAGS
