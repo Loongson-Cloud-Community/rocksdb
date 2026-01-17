@@ -270,6 +270,7 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "loongarch64")
     set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -march=loongarch64 -mtune=loongarch64")
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -march=loongarch64 -mtune=loongarch64")
   endif(HAS_LOONGARCH64)
+  add_compile_options(-include cstdint)
 endif(CMAKE_SYSTEM_PROCESSOR MATCHES "loongarch64")
 
 set(PORTABLE 0 CACHE STRING "Minimum CPU arch to support, or 0 = current CPU, 1 = baseline CPU")
