@@ -90,8 +90,9 @@ WinClock::WinClock()
 
   HMODULE module = GetModuleHandle("kernel32.dll");
   if (module != NULL) {
-    GetSystemTimePreciseAsFileTime_ = (FnGetSystemTimePreciseAsFileTime)(
-        void*)GetProcAddress(module, "GetSystemTimePreciseAsFileTime");
+    GetSystemTimePreciseAsFileTime_ =
+        (FnGetSystemTimePreciseAsFileTime)(void*)GetProcAddress(
+            module, "GetSystemTimePreciseAsFileTime");
   }
 }
 
@@ -1286,8 +1287,7 @@ struct StartThreadState {
 };
 
 void* StartThreadWrapper(void* arg) {
-  std::unique_ptr<StartThreadState> state(
-      reinterpret_cast<StartThreadState*>(arg));
+  std::unique_ptr<StartThreadState> state(static_cast<StartThreadState*>(arg));
   state->user_function(state->arg);
   return nullptr;
 }

@@ -5,8 +5,6 @@
 
 #pragma once
 
-#ifndef ROCKSDB_LITE
-
 #include <utility>
 
 #include "rocksdb/file_system.h"
@@ -122,5 +120,3 @@ class SimulatedWritableFile : public FSWritableFileWrapper {
   void SimulateIOWait(int64_t num_requests) const;
 };
 }  // namespace ROCKSDB_NAMESPACE
-
-#endif  // ROCKSDB_LITE

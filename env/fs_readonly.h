@@ -5,8 +5,6 @@
 
 #pragma once
 
-#ifndef ROCKSDB_LITE
-
 #include "rocksdb/file_system.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -103,5 +101,3 @@ class ReadOnlyFileSystem : public FileSystemWrapper {
 };
 
 }  // namespace ROCKSDB_NAMESPACE
-
-#endif  // ROCKSDB_LITE

@@ -5,10 +5,8 @@
 
 #pragma once
 
-#ifndef ROCKSDB_LITE
-
-#include "rocksdb/options.h"
 #include "port/port.h"
+#include "rocksdb/options.h"
 #include "rocksdb/utilities/optimistic_transaction_db.h"
 #include "rocksdb/utilities/transaction_db.h"
 
@@ -145,5 +143,3 @@ class RandomTransactionInserter {
 };
 
 }  // namespace ROCKSDB_NAMESPACE
-
-#endif  // ROCKSDB_LITE

@@ -9,6 +9,7 @@
 #include <mutex>
 #include <unordered_set>
 
+#include "db_stress_tool/db_stress_shared_state.h"
 #include "file/filename.h"
 #include "file/writable_file_writer.h"
 #include "rocksdb/db.h"
@@ -19,12 +20,14 @@
 #include "rocksdb/unique_id.h"
 #include "util/gflags_compat.h"
 #include "util/random.h"
+#include "utilities/fault_injection_fs.h"
 
 DECLARE_int32(compact_files_one_in);
 
+extern std::shared_ptr<ROCKSDB_NAMESPACE::FaultInjectionTestFS> fault_fs_guard;
+
 namespace ROCKSDB_NAMESPACE {
 
-#ifndef ROCKSDB_LITE
 // Verify across process executions that all seen IDs are unique
 class UniqueIdVerifier {
  public:
@@ -52,12 +55,13 @@ class DbStressListener : public EventListener {
   DbStressListener(const std::string& db_name,
                    const std::vector<DbPath>& db_paths,
                    const std::vector<ColumnFamilyDescriptor>& column_families,
-                   Env* env)
+                   Env* env, SharedState* shared)
       : db_name_(db_name),
         db_paths_(db_paths),
         column_families_(column_families),
         num_pending_file_creations_(0),
-        unique_ids_(db_name, env) {}
+        unique_ids_(db_name, env),
+        shared_(shared) {}
 
   const char* Name() const override { return kClassName(); }
   static const char* kClassName() { return "DBStressListener"; }
@@ -68,11 +72,48 @@ class DbStressListener : public EventListener {
     VerifyFilePath(info.file_path);
     // pretending doing some work here
     RandomSleep();
+    if (fault_fs_guard) {
+      fault_fs_guard->DisableAllThreadLocalErrorInjection();
+    }
+    shared_->SetPersistedSeqno(info.largest_seqno);
   }
 
   void OnFlushBegin(DB* /*db*/,
                     const FlushJobInfo& /*flush_job_info*/) override {
     RandomSleep();
+    if (fault_fs_guard) {
+      fault_fs_guard->SetThreadLocalErrorContext(
+          FaultInjectionIOType::kRead, static_cast<uint32_t>(FLAGS_seed),
+          FLAGS_read_fault_one_in,
+          FLAGS_inject_error_severity == 1 /* retryable */,
+          FLAGS_inject_error_severity == 2 /* has_data_loss*/);
+      fault_fs_guard->EnableThreadLocalErrorInjection(
+          FaultInjectionIOType::kRead);
+
+      fault_fs_guard->SetThreadLocalErrorContext(
+          FaultInjectionIOType::kWrite, static_cast<uint32_t>(FLAGS_seed),
+          FLAGS_write_fault_one_in,
+          FLAGS_inject_error_severity == 1 /* retryable */,
+          FLAGS_inject_error_severity == 2 /* has_data_loss*/);
+      fault_fs_guard->EnableThreadLocalErrorInjection(
+          FaultInjectionIOType::kWrite);
+
+      fault_fs_guard->SetThreadLocalErrorContext(
+          FaultInjectionIOType::kMetadataRead,
+          static_cast<uint32_t>(FLAGS_seed), FLAGS_metadata_read_fault_one_in,
+          FLAGS_inject_error_severity == 1 /* retryable */,
+          FLAGS_inject_error_severity == 2 /* has_data_loss*/);
+      fault_fs_guard->EnableThreadLocalErrorInjection(
+          FaultInjectionIOType::kMetadataRead);
+
+      fault_fs_guard->SetThreadLocalErrorContext(
+          FaultInjectionIOType::kMetadataWrite,
+          static_cast<uint32_t>(FLAGS_seed), FLAGS_metadata_write_fault_one_in,
+          FLAGS_inject_error_severity == 1 /* retryable */,
+          FLAGS_inject_error_severity == 2 /* has_data_loss*/);
+      fault_fs_guard->EnableThreadLocalErrorInjection(
+          FaultInjectionIOType::kMetadataWrite);
+    }
   }
 
   void OnTableFileDeleted(const TableFileDeletionInfo& /*info*/) override {
@@ -94,6 +135,48 @@ class DbStressListener : public EventListener {
     }
     // pretending doing some work here
     RandomSleep();
+  }
+
+  void OnSubcompactionBegin(const SubcompactionJobInfo& /* si */) override {
+    if (fault_fs_guard) {
+      fault_fs_guard->SetThreadLocalErrorContext(
+          FaultInjectionIOType::kRead, static_cast<uint32_t>(FLAGS_seed),
+          FLAGS_read_fault_one_in,
+          FLAGS_inject_error_severity == 1 /* retryable */,
+          FLAGS_inject_error_severity == 2 /* has_data_loss*/);
+      fault_fs_guard->EnableThreadLocalErrorInjection(
+          FaultInjectionIOType::kRead);
+
+      fault_fs_guard->SetThreadLocalErrorContext(
+          FaultInjectionIOType::kWrite, static_cast<uint32_t>(FLAGS_seed),
+          FLAGS_write_fault_one_in,
+          FLAGS_inject_error_severity == 1 /* retryable */,
+          FLAGS_inject_error_severity == 2 /* has_data_loss*/);
+      fault_fs_guard->EnableThreadLocalErrorInjection(
+          FaultInjectionIOType::kWrite);
+
+      fault_fs_guard->SetThreadLocalErrorContext(
+          FaultInjectionIOType::kMetadataRead,
+          static_cast<uint32_t>(FLAGS_seed), FLAGS_metadata_read_fault_one_in,
+          FLAGS_inject_error_severity == 1 /* retryable */,
+          FLAGS_inject_error_severity == 2 /* has_data_loss*/);
+      fault_fs_guard->EnableThreadLocalErrorInjection(
+          FaultInjectionIOType::kMetadataRead);
+
+      fault_fs_guard->SetThreadLocalErrorContext(
+          FaultInjectionIOType::kMetadataWrite,
+          static_cast<uint32_t>(FLAGS_seed), FLAGS_metadata_write_fault_one_in,
+          FLAGS_inject_error_severity == 1 /* retryable */,
+          FLAGS_inject_error_severity == 2 /* has_data_loss*/);
+      fault_fs_guard->EnableThreadLocalErrorInjection(
+          FaultInjectionIOType::kMetadataWrite);
+    }
+  }
+
+  void OnSubcompactionCompleted(const SubcompactionJobInfo& /* si */) override {
+    if (fault_fs_guard) {
+      fault_fs_guard->DisableAllThreadLocalErrorInjection();
+    }
   }
 
   void OnTableFileCreationStarted(
@@ -178,10 +261,22 @@ class DbStressListener : public EventListener {
                             Status /* bg_error */,
                             bool* /* auto_recovery */) override {
     RandomSleep();
+    if (FLAGS_error_recovery_with_no_fault_injection && fault_fs_guard) {
+      fault_fs_guard->DisableAllThreadLocalErrorInjection();
+      // TODO(hx235): only exempt the flush thread during error recovery instead
+      // of all the flush threads from error injection
+      fault_fs_guard->SetIOActivtiesExcludedFromFaultInjection(
+          {Env::IOActivity::kFlush});
+    }
   }
 
-  void OnErrorRecoveryCompleted(Status /* old_bg_error */) override {
+  void OnErrorRecoveryEnd(
+      const BackgroundErrorRecoveryInfo& /*info*/) override {
     RandomSleep();
+    if (FLAGS_error_recovery_with_no_fault_injection && fault_fs_guard) {
+      fault_fs_guard->EnableAllThreadLocalErrorInjection();
+      fault_fs_guard->SetIOActivtiesExcludedFromFaultInjection({});
+    }
   }
 
  protected:
@@ -265,7 +360,7 @@ class DbStressListener : public EventListener {
   std::vector<ColumnFamilyDescriptor> column_families_;
   std::atomic<int> num_pending_file_creations_;
   UniqueIdVerifier unique_ids_;
+  SharedState* shared_;
 };
-#endif  // !ROCKSDB_LITE
 }  // namespace ROCKSDB_NAMESPACE
 #endif  // GFLAGS
